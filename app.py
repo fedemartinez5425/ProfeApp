@@ -125,6 +125,7 @@ with st.sidebar:
     st.markdown("• Física")
     st.markdown("• Economía")
     st.markdown("• Estadística")
+    st.markdown("• Matemática Financiera")
     st.markdown("---")
     st.markdown("**Niveles:**")
     st.markdown("• Secundaria")
@@ -270,11 +271,11 @@ if sheet:
             
             with st.form("nuevo_alumno", clear_on_submit=True):
                 nombre = st.text_input("Nombre completo*")
-                materia = st.selectbox("Materia*", ["Matemática", "Física", "Economía", "Estadística"])
+                materia = st.selectbox("Materia*", ["Matemática", "Física", "Economía", "Estadística", "Matemática Financiera"])
                 curso = st.selectbox("Nivel*", ["Secundaria", "Universidad"])
                 telefono = st.text_input("Teléfono")
                 contacto = st.text_input("Contacto (responsable)")
-                precio_hora = st.number_input("Precio por hora ($)*", value=4000, step=500)
+                precio_hora = st.number_input("Precio por hora ($)*", value=5000, step=500)
                 modalidad = st.selectbox("Modalidad*", ["Presencial", "Virtual", "Híbrida"])
                 
                 submitted = st.form_submit_button("✅ Agregar Alumno", use_container_width=True)
