@@ -340,9 +340,9 @@ if sheet:
                     with col_b:
                         materia = st.selectbox(
                             "Materia*",
-                            ["Matemática", "Física", "Economía", "Estadística"],
-                            index=["Matemática", "Física", "Economía", "Estadística"].index(alumno_data['Materia']) 
-                            if alumno_data['Materia'] in ["Matemática", "Física", "Economía", "Estadística"] else 0
+                            ["Matemática", "Física", "Economía", "Estadística", "Matemática Financiera"],
+                            index=["Matemática", "Física", "Economía", "Estadística", "Matemática Financiera"].index(alumno_data['Materia']) 
+                            if alumno_data['Materia'] in ["Matemática", "Física", "Economía", "Estadística", "Matemática Financiera"] else 0
                         )
                     
                     col_c, col_d = st.columns(2)
