@@ -230,8 +230,12 @@ def save_data(sheet, worksheet_name, df):
     try:
         ws = sheet.worksheet(worksheet_name)
         ws.clear()
-        df_clean = df.fillna('').astype(str).replace('nan', '').replace('None', '')
-        data = [df_clean.columns.values.tolist()] + df_clean.values.tolist()
+        import json, math
+        df_clean = df.where(df.notna(), other='')
+        data = [df_clean.columns.values.tolist()] + [
+            ['' if isinstance(v, float) and math.isnan(v) else v for v in row]
+            for row in df_clean.values.tolist()
+        ]
         ws.update('A1', data)
         load_data.clear()
         return True
