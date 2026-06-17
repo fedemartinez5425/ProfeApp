@@ -230,7 +230,8 @@ def save_data(sheet, worksheet_name, df):
     try:
         ws = sheet.worksheet(worksheet_name)
         ws.clear()
-        data = [df.columns.values.tolist()] + df.values.tolist()
+        df_clean = df.fillna('').astype(str).replace('nan', '').replace('None', '')
+        data = [df_clean.columns.values.tolist()] + df_clean.values.tolist()
         ws.update('A1', data)
         load_data.clear()
         return True
