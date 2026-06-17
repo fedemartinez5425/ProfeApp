@@ -131,6 +131,26 @@ section[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,0.2); }
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
+# LOGIN / SISTEMA CERRADO
+# ─────────────────────────────────────────────
+if not st.session_state.get("autorizado", False):
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.markdown("<br><br>", unsafe_allow_html=True)
+        st.markdown('<p class="section-header" style="text-align: center;">🔒 Acceso Restringido</p>', unsafe_allow_html=True)
+        with st.form("login_form"):
+            pwd = st.text_input("Contraseña de acceso", type="password")
+            submit = st.form_submit_button("Ingresar", use_container_width=True)
+            
+            if submit:
+                if pwd == "tu_contraseña_aqui":
+                    st.session_state["autorizado"] = True
+                    st.rerun()
+                else:
+                    st.error("Contraseña incorrecta.")
+    st.stop()
+
+# ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
 def parse_numeric(val):
