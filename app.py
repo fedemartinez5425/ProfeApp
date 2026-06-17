@@ -131,26 +131,6 @@ section[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,0.2); }
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
-# LOGIN / SISTEMA CERRADO
-# ─────────────────────────────────────────────
-if not st.session_state.get("autorizado", False):
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        st.markdown("<br><br>", unsafe_allow_html=True)
-        st.markdown('<p class="section-header" style="text-align: center;">🔒 Acceso Restringido</p>', unsafe_allow_html=True)
-        with st.form("login_form"):
-            pwd = st.text_input("Contraseña de acceso", type="password")
-            submit = st.form_submit_button("Ingresar", use_container_width=True)
-            
-            if submit:
-                if pwd == "456123":
-                    st.session_state["autorizado"] = True
-                    st.rerun()
-                else:
-                    st.error("Contraseña incorrecta.")
-    st.stop()
-
-# ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
 def parse_numeric(val):
@@ -230,12 +210,8 @@ def save_data(sheet, worksheet_name, df):
     try:
         ws = sheet.worksheet(worksheet_name)
         ws.clear()
-        import json, math
-        df_clean = df.where(df.notna(), other='')
-        data = [df_clean.columns.values.tolist()] + [
-            ['' if isinstance(v, float) and math.isnan(v) else v for v in row]
-            for row in df_clean.values.tolist()
-        ]
+        df_clean = df.fillna('').astype(str).replace('nan', '').replace('None', '')
+        data = [df_clean.columns.values.tolist()] + df_clean.values.tolist()
         ws.update('A1', data)
         load_data.clear()
         return True
@@ -487,10 +463,11 @@ with tab2:
                     nid = int(df_an['ID_Alumno'].max()) + 1 if not df_an.empty else 1
                     nuevo = pd.DataFrame([{
                         'ID_Alumno': nid, 'Nombre': nombre.strip(), 'Materia': materia,
-                        'Curso': curso, 'Teléfono': telefono, 'Contacto': contacto,
+                        'Curso': curso, 'Teléfono': str(telefono) if telefono else '',
+                        'Contacto': str(contacto) if contacto else '',
                         'Día': '', 'Frecuencia': '', 'PrecioHora': precio_hora,
                         'Modalidad': modalidad, 'FechaAlta': datetime.now().strftime('%Y-%m-%d'),
-                        'Estado': 'Activo', 'Observaciones': obs
+                        'Estado': 'Activo', 'Observaciones': str(obs) if obs else ''
                     }])
                     df_upd = pd.concat([df_an, nuevo], ignore_index=True)
                     if save_data(sheet, "Alumnos", df_upd):
