@@ -1,0 +1,10 @@
+# Secretos y datos personales: NUNCA al repo
+*.json
+!.claude/settings.json
+*.xlsx
+.streamlit/secrets.toml
+
+# Entorno local
+__pycache__/
+.venv/
+.pytest_cache/
