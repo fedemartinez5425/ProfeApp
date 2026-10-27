@@ -1,8 +1,6 @@
 from datetime import timedelta
 
-import pandas as pd
 import pytest
-import streamlit as st
 
 import sheets
 from conftest import HOY, dia, planilla_nueva, planilla_vieja

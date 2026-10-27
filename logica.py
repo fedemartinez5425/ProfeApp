@@ -6,7 +6,8 @@ desde scripts/corregir_datos.py.
 import math
 import re
 import unicodedata
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
+from urllib.parse import quote
 
 import pandas as pd
 
@@ -147,6 +148,10 @@ def format_fecha(f):
 
 def format_pct(p):
     return f"{p:+.1f}%".replace('.', ',')
+
+
+def format_dias(d):
+    return '—' if d is None or pd.isna(d) else f"{int(d)} días"
 
 
 # ─────────────────────────────────────────────
@@ -431,3 +436,227 @@ def plan_aumento(ids, modo, valor, desde, df_tarifas, df_alumnos, redondear_a=10
             'Variación %': ((nuevo / actual - 1) * 100) if actual else None,
         })
     return pd.DataFrame(filas, columns=['ID_Alumno', 'Alumno', 'Tipo', 'Actual', 'Nuevo', 'Variación %'])
+
+
+# ─────────────────────────────────────────────
+# IPC E INFLACIÓN
+# ─────────────────────────────────────────────
+def parse_mes(val):
+    """'2026-10', '2026-10-01', '10/2026', fecha o número de serie → 'aaaa-mm' (o '')."""
+    if val is None or val == '':
+        return ''
+    s = str(val).strip()
+    m = re.match(r'^(\d{4})-(\d{1,2})$', s)
+    if m:
+        return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}"
+    m = re.match(r'^(\d{1,2})/(\d{4})$', s)
+    if m:
+        return f"{int(m.group(2)):04d}-{int(m.group(1)):02d}"
+    f = parse_fecha(val)
+    return '' if pd.isna(f) else f.strftime('%Y-%m')
+
+
+def normalizar_ipc(df):
+    if df is None or df.empty:
+        return pd.DataFrame(columns=['Mes', 'VariacionPct'])
+    df = df.copy()
+    for c in COLUMNAS_IPC:
+        if c not in df.columns:
+            df[c] = ''
+    df['Mes'] = df['Mes'].apply(parse_mes)
+    df['VariacionPct'] = pd.to_numeric(df['VariacionPct'].apply(parse_numero, tipo='horas'), errors='coerce')
+    df = df[(df['Mes'] != '') & df['VariacionPct'].notna()]
+    return df.drop_duplicates('Mes', keep='last').sort_values('Mes')[['Mes', 'VariacionPct']]
+
+
+def meses_entre(desde_mes, hasta_mes):
+    """Meses 'aaaa-mm' desde desde_mes (incluido) hasta hasta_mes (excluido)."""
+    p, fin = pd.Period(desde_mes, 'M'), pd.Period(hasta_mes, 'M')
+    out = []
+    while p < fin:
+        out.append(str(p))
+        p += 1
+    return out
+
+
+def inflacion_acumulada(df_ipc, desde_mes, hasta_mes):
+    """(% acumulado, meses sin dato) para los meses en que rigió la tarifa anterior."""
+    meses = meses_entre(desde_mes, hasta_mes)
+    tabla = dict(zip(df_ipc['Mes'], df_ipc['VariacionPct'])) if df_ipc is not None else {}
+    factor, faltan = 1.0, []
+    for m in meses:
+        if m in tabla:
+            factor *= 1 + tabla[m] / 100
+        else:
+            faltan.append(m)
+    return (factor - 1) * 100, faltan
+
+
+def comparar_aumentos_ipc(df_tarifas, df_ipc, df_alumnos):
+    """Cada aumento (tarifa vs. la anterior del mismo alumno y tipo) contra la inflación del período."""
+    columnas = ['ID_Alumno', 'Alumno', 'Desde anterior', 'Desde', 'Anterior', 'Nueva', 'Aumento %',
+                'Inflación %', 'Diferencia real %', 'Meses sin IPC']
+    if df_tarifas is None or df_tarifas.empty:
+        return pd.DataFrame(columns=columnas)
+    nombres = nombres_por_id(df_alumnos)
+    filas = []
+    for (id_alumno, tipo), t in df_tarifas.sort_values(['Desde', 'ID_Tarifa']).groupby(['ID_Alumno', 'Tipo']):
+        previa = None
+        for _, r in t.iterrows():
+            if previa is not None and previa['Monto'] > 0 and r['Monto'] != previa['Monto']:
+                aumento = (r['Monto'] / previa['Monto'] - 1) * 100
+                inflacion, faltan = inflacion_acumulada(df_ipc, previa['Desde'].strftime('%Y-%m'),
+                                                        r['Desde'].strftime('%Y-%m'))
+                filas.append({
+                    'ID_Alumno': id_alumno, 'Alumno': nombres.get(id_alumno, f"#{id_alumno}"),
+                    'Desde anterior': previa['Desde'], 'Desde': r['Desde'],
+                    'Anterior': previa['Monto'], 'Nueva': r['Monto'], 'Aumento %': aumento,
+                    'Inflación %': inflacion,
+                    'Diferencia real %': ((1 + aumento / 100) / (1 + inflacion / 100) - 1) * 100,
+                    'Meses sin IPC': ', '.join(faltan),
+                })
+            # Una tarifa recargada con el mismo monto no corta el período de la anterior
+            if previa is None or r['Monto'] != previa['Monto']:
+                previa = r
+    return pd.DataFrame(filas, columns=columnas)
+
+
+def texto_vs_inflacion(diferencia_real):
+    if diferencia_real is None or pd.isna(diferencia_real):
+        return '—'
+    if abs(diferencia_real) < 0.05:
+        return "empataste con la inflación"
+    verbo = "le ganaste" if diferencia_real > 0 else "le perdiste"
+    return f"{verbo} a la inflación por {abs(diferencia_real):.1f}%".replace('.', ',')
+
+
+# ─────────────────────────────────────────────
+# RESUMEN PARA WHATSAPP
+# ─────────────────────────────────────────────
+def resumen_mensual(df_clases, id_alumno, nombre, mes, anio):
+    """Texto listo para mandar por WhatsApp con las clases del mes de un alumno."""
+    d = filtrar_mes(df_clases[df_clases['ID_Alumno'] == id_alumno], mes, anio).sort_values(['Fecha', 'ID_Clase'])
+    titulo = f"Hola! Te paso el resumen de clases de {nombre} de {MESES[mes - 1].lower()} {anio}:"
+    if d.empty:
+        return titulo + "\n\nNo hubo clases este mes."
+    lineas = [titulo, ""]
+    for _, c in d.iterrows():
+        estado = "" if c['Pagada'] else " (pendiente)"
+        lineas.append(f"• {format_fecha(c['Fecha'])}: {format_hours(c['Horas'])} · {format_currency(c['Monto'])}{estado}")
+    total, pendiente = d['Monto'].sum(), d[~d['Pagada']]['Monto'].sum()
+    lineas += ["", f"Total: {len(d)} clase{'s' if len(d) != 1 else ''} · {format_hours(d['Horas'].sum())} · "
+               f"{format_currency(total)}"]
+    if pendiente > 0:
+        lineas.append(f"Pendiente de pago: {format_currency(pendiente)}")
+    lineas += ["", "¡Gracias!"]
+    return "\n".join(lineas)
+
+
+def telefono_whatsapp(telefono):
+    """Número argentino para wa.me sin el 549 (área + número, 10 dígitos), o '' si no sirve."""
+    dig = re.sub(r'\D', '', texto(telefono))
+    if dig.startswith('549'):
+        dig = dig[3:]
+    elif dig.startswith('54'):
+        dig = dig[2:]
+    dig = dig.lstrip('0')
+    # 0264 15 4123456 → 264 4123456
+    m = re.match(r'^(\d{2,4})15(\d{6,8})$', dig)
+    if m and len(m.group(1) + m.group(2)) == 10:
+        dig = m.group(1) + m.group(2)
+    return dig if len(dig) == 10 else ''
+
+
+def link_whatsapp(telefono, mensaje):
+    numero = telefono_whatsapp(telefono)
+    if not numero:
+        return None
+    return f"https://wa.me/549{numero}?text={quote(mensaje)}"
+
+
+# ─────────────────────────────────────────────
+# COBROS PENDIENTES
+# ─────────────────────────────────────────────
+def cobros_pendientes(df_clases, hoy):
+    """Clases no pagadas con antigüedad en días, más vieja primero."""
+    if df_clases is None or df_clases.empty:
+        return pd.DataFrame(columns=['ID_Clase', 'ID_Alumno', 'Alumno', 'Fecha', 'Horas', 'Monto', 'Dias'])
+    p = df_clases[~df_clases['Pagada']].copy()
+    # Sin fecha → antigüedad desconocida (NaN, se muestra "—"); clases futuras → 0 días
+    p['Dias'] = (pd.Timestamp(hoy) - p['Fecha']).dt.days.clip(lower=0)
+    return p.sort_values(['Fecha', 'ID_Clase'], na_position='last')[['ID_Clase', 'ID_Alumno', 'Alumno', 'Fecha', 'Horas', 'Monto', 'Dias']]
+
+
+def pendientes_por_alumno(pend):
+    if pend.empty:
+        return pd.DataFrame(columns=['ID_Alumno', 'Alumno', 'Clases', 'Monto', 'MasVieja'])
+    return (pend.groupby('ID_Alumno', as_index=False)
+            .agg(Alumno=('Alumno', 'last'), Clases=('ID_Clase', 'count'), Monto=('Monto', 'sum'),
+                 MasVieja=('Dias', 'max'))
+            .sort_values('MasVieja', ascending=False))
+
+
+# ─────────────────────────────────────────────
+# PROYECCIÓN
+# ─────────────────────────────────────────────
+def promedio_mensual_historico(df_clases, hoy):
+    """Ingreso promedio por mes desde el primer mes con clases hasta el último mes completo, con ceros."""
+    d = df_clases.dropna(subset=['Fecha']) if df_clases is not None else pd.DataFrame()
+    if d.empty:
+        return 0.0, 0
+    primero = d['Fecha'].min().to_period('M')
+    ultimo = pd.Timestamp(hoy).to_period('M') - 1
+    if ultimo < primero:
+        return 0.0, 0
+    meses = pd.period_range(primero, ultimo, freq='M')
+    por_mes = d.groupby(d['Fecha'].dt.to_period('M'))['Monto'].sum().reindex(meses, fill_value=0)
+    return float(por_mes.mean()), len(meses)
+
+
+def proyeccion_mensual(df_clases, hoy, dias_activo=30, dias_base=90):
+    """Proyección por alumno: activos = con clases en los últimos `dias_activo` días.
+
+    Frecuencia = clases por semana en los últimos `dias_base` días (o desde su primera clase si es más
+    reciente, mínimo 4 semanas); monto = promedio por clase en esa ventana.
+    """
+    columnas = ['ID_Alumno', 'Alumno', 'ClasesSemana', 'MontoClase', 'Mensual']
+    d = df_clases.dropna(subset=['Fecha']) if df_clases is not None else pd.DataFrame()
+    if d.empty:
+        return pd.DataFrame(columns=columnas)
+    hoy = pd.Timestamp(hoy).normalize()
+    d = d[d['Fecha'] <= hoy].sort_values(['Fecha', 'ID_Clase'])
+    activos = d[d['Fecha'] > hoy - pd.Timedelta(days=dias_activo)]['ID_Alumno'].unique()
+    filas = []
+    for id_alumno in activos:
+        da = d[d['ID_Alumno'] == id_alumno]
+        inicio = max(hoy - pd.Timedelta(days=dias_base), da['Fecha'].min())
+        ventana = da[(da['Fecha'] >= inicio) & (da['Fecha'] <= hoy)]
+        semanas = max((hoy - inicio).days + 1, 28) / 7
+        por_semana = len(ventana) / semanas
+        monto_clase = float(ventana['Monto'].mean()) if not ventana.empty else 0.0
+        filas.append({'ID_Alumno': id_alumno, 'Alumno': da['Alumno'].iloc[-1], 'ClasesSemana': por_semana,
+                      'MontoClase': monto_clase, 'Mensual': por_semana * 52 / 12 * monto_clase})
+    return pd.DataFrame(filas, columns=columnas).sort_values('Mensual', ascending=False)
+
+
+# ─────────────────────────────────────────────
+# AGENDA
+# ─────────────────────────────────────────────
+FRECUENCIAS = ['', 'Semanal', '2 veces por semana', '3 veces por semana', 'Quincenal', 'Mensual', 'Ocasional']
+
+
+def dias_de_texto(valor):
+    """'Lunes, Jueves' / 'lunes y jueves' / 'Miercoles' → ['Lunes', 'Jueves'] (en orden de la semana)."""
+    t = sin_tildes(valor)
+    return [d for d in DIAS_SEMANA if sin_tildes(d) in t]
+
+
+def agenda_semanal(df_alumnos):
+    """{día: [(ID_Alumno, Nombre, Frecuencia, Materia)]} con los alumnos Activos que tienen Día cargado."""
+    agenda = {d: [] for d in DIAS_SEMANA}
+    if df_alumnos is None or df_alumnos.empty:
+        return agenda
+    for _, a in df_alumnos[df_alumnos['Estado'] == 'Activo'].sort_values('Nombre').iterrows():
+        for d in dias_de_texto(a['Día']):
+            agenda[d].append((a['ID_Alumno'], a['Nombre'], a['Frecuencia'], a['Materia']))
+    return agenda

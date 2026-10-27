@@ -1,5 +1,30 @@
 # Changelog
 
+## Fase 3 — potenciar (v3.0)
+- **💲 Tarifas**: gráfico de $/hora efectivo y $/clase por alumno en el tiempo. Si existe la hoja `IPC`
+  con datos, compara cada cambio de tarifa con la inflación acumulada ("le ganaste / le perdiste a la
+  inflación por X%").
+- **💬 Cobros y resúmenes** (pestaña nueva): cobros pendientes por alumno con antigüedad en días, detalle por
+  clase y botón para marcar como pagadas todas las clases pendientes de un alumno. Resumen mensual por
+  alumno listo para WhatsApp (recuadro con botón de copiar) y link `https://wa.me/549<teléfono>`.
+- **📈 Análisis**: proyección nueva basada en los alumnos con clases en los últimos 30 días y su frecuencia
+  real; promedio histórico mensual contando los meses sin clases como $ 0.
+- **📅 Agenda** (pestaña nueva): semana con los alumnos activos según `Día` y `Frecuencia`, editables desde
+  la ficha (Alumnos → Editar ficha).
+- Barra lateral con la versión (`v3.0 · 2026`) y la fecha del último deploy (último commit de git; si no
+  hay git, la fecha del archivo).
+
+### Decisiones tomadas sin consultar
+- Inflación de un aumento = IPC compuesto de los meses en que rigió la tarifa anterior: desde el mes de su
+  `Desde` hasta el mes anterior al aumento. Meses faltantes en `IPC` cuentan como 0 % y se listan.
+  `VariacionPct` es el % mensual (2,7 = 2,7 %). La hoja `IPC` acepta `Mes` como `aaaa-mm`, `mm/aaaa` o fecha.
+- Proyección: frecuencia = clases por semana en los últimos 90 días (o desde la primera clase si es más
+  nueva, mínimo 4 semanas) × 52/12 × monto promedio por clase en esa ventana.
+- Teléfono para WhatsApp: se toman los dígitos, se sacan `+54`, `9`, el `0` inicial y el `15` después de la
+  característica; tiene que quedar de 10 dígitos (ej. 2645123029) o no se muestra el link.
+- `Día` se guarda como "Lunes, Jueves". Si la ficha tenía texto libre y no se tocan los días, no se reescribe.
+- "Marcar como pagadas" usa el método elegido y marca todas las pendientes de ese alumno.
+
 ## Fase 2 — que no haga falta tocar el Sheet
 - `sheets.py`: `actualizar(hoja, id, cambios)` escribe solo las celdas de la fila de ese ID (buscada en el
   momento, error si el ID no existe o está repetido) y `borrar(hoja, id)` hace `delete_rows` de esa fila.

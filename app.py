@@ -1,4 +1,7 @@
 import hmac
+import html
+import os
+import subprocess
 import time
 from datetime import date, datetime
 
@@ -11,11 +14,28 @@ import sheets
 from logica import (
     COLUMNAS_CLASES_NUEVAS, ESTADOS, MESES, METODOS,
     anios_disponibles, aplicar_nombres, clases_mismo_dia, columnas_faltantes,
-    cambios_historial, filtrar_mes, format_currency, format_fecha, format_hours, format_pct,
-    monto_sugerido, normalizar_alumnos, normalizar_clases, normalizar_tarifas, plan_aumento,
-    precio_hora_por_mes, tabla_editable_clases, tarifa_vigente, ultima_tarifa_cargada,
-    validar_cambios,
+    DIAS_SEMANA, FRECUENCIAS, agenda_semanal, cambios_historial, cobros_pendientes,
+    comparar_aumentos_ipc, dias_de_texto, filtrar_mes, format_currency, format_fecha, format_hours,
+    format_dias, format_pct, link_whatsapp, monto_sugerido, normalizar_alumnos, normalizar_clases, normalizar_ipc,
+    normalizar_tarifas, pendientes_por_alumno, plan_aumento, precio_hora_por_mes,
+    promedio_mensual_historico, proyeccion_mensual, resumen_mensual, tabla_editable_clases,
+    tarifa_vigente, texto_vs_inflacion, ultima_tarifa_cargada, validar_cambios,
 )
+
+APP_VERSION = "v3.0 · 2026"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fecha_ultimo_deploy():
+    """Fecha del último commit desplegado (git); si no hay git, la del archivo app.py."""
+    try:
+        r = subprocess.run(['git', 'log', '-1', '--format=%cI'], capture_output=True, text=True, timeout=3,
+                           cwd=os.path.dirname(os.path.abspath(__file__)))
+        if r.returncode == 0 and r.stdout.strip():
+            return datetime.fromisoformat(r.stdout.strip()).strftime('%d/%m/%Y %H:%M')
+    except Exception:
+        pass
+    return datetime.fromtimestamp(os.path.getmtime(os.path.abspath(__file__))).strftime('%d/%m/%Y %H:%M')
 
 # ─────────────────────────────────────────────
 # CONFIGURACIÓN DE PÁGINA
@@ -194,6 +214,7 @@ def cargar_datos():
     raw_clases = sheets.leer(sheet, "Clases")
     raw_alumnos = sheets.leer(sheet, "Alumnos")
     raw_tarifas = sheets.leer(sheet, "Tarifas")
+    raw_ipc = sheets.leer(sheet, "IPC")
 
     if raw_clases is None:
         avisos.append("No existe la hoja **Clases**: se muestra todo vacío.")
@@ -217,10 +238,11 @@ def cargar_datos():
 
     df_alumnos = normalizar_alumnos(raw_alumnos)
     df_clases = aplicar_nombres(normalizar_clases(raw_clases), df_alumnos)
-    return df_clases, df_alumnos, df_tarifas, avisos, list(raw_clases.columns)
+    df_ipc = normalizar_ipc(raw_ipc) if raw_ipc is not None else None
+    return df_clases, df_alumnos, df_tarifas, df_ipc, avisos, list(raw_clases.columns)
 
 
-df_clases, df_alumnos, df_tarifas, avisos, columnas_clases = cargar_datos()
+df_clases, df_alumnos, df_tarifas, df_ipc, avisos, columnas_clases = cargar_datos()
 hoy = date.today()
 
 
@@ -259,7 +281,7 @@ with st.sidebar:
         st.markdown(f"• {m}")
     st.markdown("**Niveles:** Secundaria · Universidad")
     st.markdown("---")
-    st.caption("v2.1 · 2026")
+    st.caption(f"{APP_VERSION} · deploy {fecha_ultimo_deploy()}")
 
 if not PASSWORD_APP:
     st.error(AVISO_PASSWORD)
@@ -268,12 +290,14 @@ if avisos:
         for a in avisos:
             st.markdown(f"- {a}")
 
-tab1, tab2, tab3, tab4, tab_tarifas, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab_cobros, tab_tarifas, tab_agenda, tab5 = st.tabs([
     "📊 Dashboard",
     "👨‍🎓 Alumnos",
     "📝 Registrar Clase",
     "💰 Historial",
+    "💬 Cobros y resúmenes",
     "💲 Tarifas",
+    "📅 Agenda",
     "📈 Análisis"
 ])
 
@@ -453,11 +477,23 @@ with tab2:
                                             index=ESTADOS.index(af['Estado']) if af['Estado'] in ESTADOS else 0)
                     f_contacto = st.text_input("Contacto / Responsable", value=af['Contacto'],
                                                key=f"ficha_contacto_{id_f}")
+                c3, c4 = st.columns(2)
+                with c3:
+                    f_dias = st.multiselect("Días de clase", DIAS_SEMANA, default=dias_de_texto(af['Día']),
+                                            key=f"ficha_dias_{id_f}")
+                with c4:
+                    frecs = FRECUENCIAS + ([af['Frecuencia']] if af['Frecuencia'] not in FRECUENCIAS else [])
+                    f_frec = st.selectbox("Frecuencia", frecs, index=frecs.index(af['Frecuencia']),
+                                          format_func=lambda x: x or '—', key=f"ficha_frec_{id_f}")
                 f_obs = st.text_area("Observaciones", value=af['Observaciones'], height=68, key=f"ficha_obs_{id_f}")
 
                 if st.form_submit_button("💾 Guardar ficha", width="stretch"):
                     nuevos = {'Nombre': f_nombre.strip(), 'Teléfono': f_tel.strip(), 'Estado': f_estado,
-                              'Contacto': f_contacto.strip(), 'Observaciones': f_obs.strip()}
+                              'Contacto': f_contacto.strip(), 'Observaciones': f_obs.strip(),
+                              'Frecuencia': f_frec}
+                    # Día se reescribe solo si cambió la selección (respeta textos libres viejos)
+                    if f_dias != dias_de_texto(af['Día']):
+                        nuevos['Día'] = ', '.join(f_dias)
                     cambios = {c: v for c, v in nuevos.items() if v != af[c]}
                     if not nuevos['Nombre']:
                         st.error("El nombre es obligatorio")
@@ -822,6 +858,124 @@ with tab4:
                         st.rerun()
 
 # ═══════════════════════════════════════════════
+# TAB · COBROS Y RESÚMENES
+# ═══════════════════════════════════════════════
+with tab_cobros:
+    st.markdown('<p class="section-header">💬 Cobros y resúmenes</p>', unsafe_allow_html=True)
+    st.markdown('<p class="section-sub">Lo que te deben y el resumen del mes para mandar por WhatsApp</p>',
+                unsafe_allow_html=True)
+    if st.session_state.get("flash_cobros"):
+        st.success(st.session_state.pop("flash_cobros"))
+
+    st.markdown("#### ⏳ Cobros pendientes")
+    pend = cobros_pendientes(df_clases, hoy)
+    if pend.empty:
+        st.success("No tenés cobros pendientes 🎉")
+    else:
+        por_alumno = pendientes_por_alumno(pend)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("💰 Total pendiente", format_currency(pend['Monto'].sum()))
+        m2.metric("📚 Clases sin cobrar", len(pend))
+        m3.metric("🕰️ La más vieja", format_dias(pend['Dias'].max()))
+        st.dataframe(pd.DataFrame({
+            'Alumno': por_alumno['Alumno'],
+            'Clases': por_alumno['Clases'],
+            'Monto': por_alumno['Monto'].apply(format_currency),
+            'Más vieja': por_alumno['MasVieja'].map(format_dias),
+        }), width="stretch", hide_index=True)
+        with st.expander("Ver detalle por clase"):
+            st.dataframe(pd.DataFrame({
+                'ID': pend['ID_Clase'],
+                'Fecha': pend['Fecha'].apply(format_fecha),
+                'Alumno': pend['Alumno'],
+                'Horas': pend['Horas'].apply(format_hours),
+                'Monto': pend['Monto'].apply(format_currency),
+                'Antigüedad': pend['Dias'].map(format_dias),
+            }), width="stretch", hide_index=True)
+
+        st.markdown("##### ✅ Registrar un cobro")
+        ids_pend = por_alumno['ID_Alumno'].tolist()
+        if st.session_state.get("cob_alumno") not in ids_pend:
+            st.session_state.pop("cob_alumno", None)
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            id_cob = st.selectbox("Alumno", ids_pend, format_func=nombre_alumno, key="cob_alumno")
+        with cc2:
+            metodo_cob = st.selectbox("Método", METODOS, key="cob_metodo")
+        clases_cob = pend[pend['ID_Alumno'] == id_cob]
+        version_cob = st.session_state.get("cob_version", 0)
+        ok_cob = st.checkbox(f"Marcar como pagadas {len(clases_cob)} clase(s) de {nombre_alumno(id_cob)} "
+                             f"por {format_currency(clases_cob['Monto'].sum())}", key=f"cob_ok_{version_cob}_{id_cob}")
+        if st.button("✅ Marcar como pagadas", type="primary", disabled=not ok_cob, key="cob_guardar"):
+            hechos, fallas = [], []
+            for id_clase in clases_cob['ID_Clase']:
+                try:
+                    sheets.actualizar(sheet, "Clases", int(id_clase), {'¿Pagada?': 'Sí', 'Método': metodo_cob})
+                    hechos.append(f"#{id_clase}")
+                except Exception as e:
+                    fallas.append(f"#{id_clase}: {e}")
+            st.session_state["cob_version"] = version_cob + 1
+            msg = f"✅ Cobro registrado: {', '.join(hechos)}"
+            if fallas:
+                msg += " · ⚠️ Fallaron: " + "; ".join(fallas)
+            st.session_state["flash_cobros"] = msg
+            st.rerun()
+
+    st.markdown("---")
+    st.markdown("#### 💬 Resumen mensual para WhatsApp")
+    if df_alumnos.empty:
+        st.info("No hay alumnos registrados aún.")
+    else:
+        w1, w2, w3 = st.columns([2, 1, 1])
+        with w1:
+            ids_wa = df_alumnos[df_alumnos['Estado'] != 'Baja'].sort_values('Nombre')['ID_Alumno'].tolist()
+            id_wa = st.selectbox("Alumno", ids_wa, format_func=nombre_alumno, key="wa_alumno")
+        with w2:
+            mes_wa = st.selectbox("Mes", MESES, index=hoy.month - 1, key="wa_mes")
+        with w3:
+            anios_wa = anios_disponibles(df_clases, hoy)
+            anio_wa = st.selectbox("Año", anios_wa, index=anios_wa.index(hoy.year), key="wa_anio")
+        if id_wa is not None:
+            alumno_wa = df_alumnos[df_alumnos['ID_Alumno'] == id_wa].iloc[0]
+            mensaje = resumen_mensual(df_clases, id_wa, alumno_wa['Nombre'], MESES.index(mes_wa) + 1, anio_wa)
+            st.caption("Copiá el texto con el botón de la esquina del recuadro.")
+            st.code(mensaje, language=None)
+            link = link_whatsapp(alumno_wa['Teléfono'], mensaje)
+            if link:
+                st.link_button("📲 Abrir en WhatsApp", link)
+            else:
+                st.caption("Sin teléfono válido en la ficha: cargalo en Alumnos → Editar ficha para tener el link.")
+
+# ═══════════════════════════════════════════════
+# TAB · AGENDA
+# ═══════════════════════════════════════════════
+with tab_agenda:
+    st.markdown('<p class="section-header">📅 Agenda semanal</p>', unsafe_allow_html=True)
+    st.markdown('<p class="section-sub">Alumnos activos según el día y la frecuencia de su ficha</p>',
+                unsafe_allow_html=True)
+    agenda = agenda_semanal(df_alumnos)
+    dia_hoy = DIAS_SEMANA[hoy.weekday()]
+    columnas_dias = st.columns(7)
+    for col, dia in zip(columnas_dias, DIAS_SEMANA):
+        with col:
+            st.markdown(f"**{'📍 ' if dia == dia_hoy else ''}{dia}**")
+            if not agenda[dia]:
+                st.caption("—")
+            for _, nombre_ag, frec, mat in agenda[dia]:
+                st.markdown(f"""
+                <div class="clase-card">
+                    <b>{html.escape(nombre_ag)}</b><br>
+                    <span style="color:#888;">{html.escape(mat)}{' · ' + html.escape(frec) if frec else ''}</span>
+                </div>
+                """, unsafe_allow_html=True)
+    if not df_alumnos.empty:
+        activos_ag = df_alumnos[df_alumnos['Estado'] == 'Activo']
+        sin_dia = activos_ag[activos_ag['Día'].apply(lambda d: not dias_de_texto(d))]
+        if not sin_dia.empty:
+            st.info("Activos sin día cargado: " + ", ".join(sin_dia['Nombre']) +
+                    ". Cargalo en Alumnos → Editar ficha.")
+
+# ═══════════════════════════════════════════════
 # TAB · TARIFAS
 # ═══════════════════════════════════════════════
 with tab_tarifas:
@@ -938,6 +1092,62 @@ with tab_tarifas:
                         st.session_state["flash_tarifas"] = msg
                         st.rerun()
 
+with tab_tarifas:
+    if not df_clases.empty:
+        st.markdown("---")
+        st.markdown("#### 📈 $/hora efectivo y $/clase en el tiempo")
+        ids_graf = sorted(df_clases['ID_Alumno'].unique().tolist(), key=lambda i: nombre_alumno(i).lower())
+        activos_graf = [i for i in ids_graf
+                        if i in set(df_alumnos[df_alumnos['Estado'] == 'Activo']['ID_Alumno'])]
+        g1, g2 = st.columns([3, 1])
+        with g1:
+            sel_graf = st.multiselect("Alumnos", ids_graf, default=activos_graf, format_func=nombre_alumno,
+                                      key="tar_graf_alumnos")
+        with g2:
+            metrica = st.radio("Ver", ["$/hora efectivo", "$/clase"], horizontal=True, key="tar_graf_metrica")
+        d_graf = (df_clases[df_clases['ID_Alumno'].isin(sel_graf)].dropna(subset=['Fecha'])
+                  .sort_values(['Fecha', 'ID_Clase']))
+        if d_graf.empty:
+            st.info("Elegí al menos un alumno con clases.")
+        else:
+            col_y = 'PorHora' if metrica == "$/hora efectivo" else 'Monto'
+            fig_t = px.line(d_graf, x='Fecha', y=col_y, color='Alumno', markers=True,
+                            hover_data={'ID_Clase': True, 'Horas': True},
+                            labels={col_y: metrica, 'Fecha': ''},
+                            color_discrete_sequence=px.colors.qualitative.Set2)
+            fig_t.update_layout(plot_bgcolor='white', height=340, margin=dict(l=0, r=0, t=10, b=0),
+                                legend=dict(orientation='h', yanchor='bottom', y=1, xanchor='right', x=1),
+                                yaxis=dict(gridcolor='#f0f0f0'))
+            st.plotly_chart(fig_t, width="stretch")
+
+    st.markdown("#### 📊 Aumentos vs. inflación")
+    if df_tarifas is None:
+        st.info("Necesita la hoja **Tarifas** para comparar aumentos.")
+    elif df_ipc is None:
+        st.info("Para comparar con la inflación, creá una hoja **IPC** con las columnas `Mes` (aaaa-mm) y "
+                "`VariacionPct` (por ejemplo 2,7 para 2,7 % mensual) y cargá los datos del INDEC.")
+    elif df_ipc.empty:
+        st.info("La hoja **IPC** está vacía: cargá `Mes` (aaaa-mm) y `VariacionPct` de cada mes.")
+    else:
+        comp = comparar_aumentos_ipc(df_tarifas, df_ipc, df_alumnos)
+        if comp.empty:
+            st.info("Todavía no hay cambios de tarifa para comparar.")
+        else:
+            st.dataframe(pd.DataFrame({
+                'Alumno': comp['Alumno'],
+                'Período': [f"{format_fecha(a)} → {format_fecha(b)}" for a, b in
+                            zip(comp['Desde anterior'], comp['Desde'])],
+                'Anterior': comp['Anterior'].apply(format_currency),
+                'Nueva': comp['Nueva'].apply(format_currency),
+                'Aumento': comp['Aumento %'].apply(format_pct),
+                'Inflación': comp['Inflación %'].apply(format_pct),
+                'Resultado': comp['Diferencia real %'].apply(texto_vs_inflacion),
+                'Meses sin IPC': comp['Meses sin IPC'],
+            }), width="stretch", hide_index=True)
+            st.caption("Inflación acumulada de los meses en que rigió la tarifa anterior (desde el mes de su "
+                       "'Desde' hasta el mes anterior al aumento). Si faltan meses en la hoja IPC, el "
+                       "resultado los toma como 0 % y se listan en la última columna.")
+
 # ═══════════════════════════════════════════════
 # TAB 5 · ANÁLISIS
 # ═══════════════════════════════════════════════
@@ -1023,14 +1233,20 @@ with tab5:
 
         # ── Bloque 4: Proyección ──
         st.markdown("#### 💡 Proyección Mensual")
-        total_alumnos = int((df_alumnos['Estado'] == 'Activo').sum()) if not df_alumnos.empty else 0
-        n_meses = max(df_an['Mes'].nunique(), 1)
-        ing_prom_mes = df_an.groupby('Mes')['Monto'].sum().mean()
-        clases_prom  = len(df_an) / n_meses
-        horas_prom   = df_an['Horas'].sum() / n_meses
-
+        proy = proyeccion_mensual(df_clases, hoy)
+        prom_hist, n_meses_hist = promedio_mensual_historico(df_clases, hoy)
         p1, p2, p3, p4 = st.columns(4)
-        p1.metric("👨‍🎓 Alumnos Activos",       total_alumnos)
-        p2.metric("📊 Clases promedio/mes",     f"{clases_prom:.0f}")
-        p3.metric("⏰ Horas promedio/mes",       format_hours(horas_prom))
-        p4.metric("💰 Ingreso proyectado/mes",  format_currency(ing_prom_mes))
+        p1.metric("👨‍🎓 Activos (clases en 30 días)", len(proy))
+        p2.metric("📊 Clases/semana estimadas", f"{proy['ClasesSemana'].sum():.1f}".replace('.', ','))
+        p3.metric("💰 Proyección próximo mes", format_currency(proy['Mensual'].sum()))
+        p4.metric("📅 Promedio histórico/mes", format_currency(prom_hist),
+                  help=f"Promedio de {n_meses_hist} meses completos, contando los meses sin clases como $ 0.")
+        if not proy.empty:
+            st.dataframe(pd.DataFrame({
+                'Alumno': proy['Alumno'],
+                'Clases/semana': proy['ClasesSemana'].map(lambda x: f"{x:.2f}".replace('.', ',')),
+                'Monto por clase': proy['MontoClase'].apply(format_currency),
+                'Proyección mensual': proy['Mensual'].apply(format_currency),
+            }), width="stretch", hide_index=True)
+        st.caption("Activos = alumnos con al menos una clase en los últimos 30 días. Frecuencia y monto por clase "
+                   "salen de sus clases de los últimos 90 días (o desde su primera clase, mínimo 4 semanas).")

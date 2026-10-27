@@ -9,6 +9,8 @@ Antes de cada push: skill `deploy-produccion`.
 ## Archivos
 - `app.py`: UI (pestañas). `sheets.py`: acceso a Sheets (`leer`, `agregar`, `actualizar`, `borrar`).
   `logica.py`: lógica pura (parser, normalización, tarifas, métricas), sin Streamlit.
+- Pestañas: Dashboard, Alumnos (alta y ficha), Registrar Clase, Historial (editable), Cobros y resúmenes
+  (WhatsApp), Tarifas (aumentos, gráficos, IPC), Agenda, Análisis (proyección).
 - `scripts/corregir_datos.py`: genera el Excel corregido. `tests/`: pytest + AppTest con Sheet falso.
 
 ## Correr local (Windows)
