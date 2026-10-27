@@ -1,5 +1,28 @@
 # Changelog
 
+## Fase 2 — que no haga falta tocar el Sheet
+- `sheets.py`: `actualizar(hoja, id, cambios)` escribe solo las celdas de la fila de ese ID (buscada en el
+  momento, error si el ID no existe o está repetido) y `borrar(hoja, id)` hace `delete_rows` de esa fila.
+  Ambas con `RAW` e invalidando la caché. Las columnas que no existen en el Sheet se ignoran.
+- Historial editable con `st.data_editor`: fecha, horas reales, monto cobrado, pagada, método, revisar y nota.
+  Solo se guardan las filas cambiadas. Borrado de una clase con confirmación. Vista rápida "Pendientes de
+  cobro" y "A revisar".
+- Alumnos: edición de ficha (nombre, teléfono, contacto, estado, observaciones).
+- Nueva pestaña **💲 Tarifas**: historial por alumno, tarifa vigente y **Aplicar aumento** (monto nuevo o %,
+  a uno, varios o todos los activos, desde una fecha). Crea filas en `Tarifas` y actualiza `PrecioHora`.
+
+### Decisiones tomadas sin consultar
+- Registrar una clase de un alumno **Pausado** lo pasa a **Activo** automáticamente (avisa en el mensaje).
+  Los de **Baja** no aparecen para registrar clases.
+- Aumento por %: se calcula sobre la tarifa vigente el día anterior a "Desde" y se redondea a $ 100
+  (se puede desactivar). El tipo de tarifa (Hora/Clase/Mensual) se conserva.
+- Aumento con "Desde" futuro: se crea la fila en `Tarifas` pero no se toca `PrecioHora` hasta esa fecha
+  (Registrar Clase ya usa la tarifa según la fecha de la clase).
+- Sin hoja `Tarifas`, "Aplicar aumento" solo actualiza `PrecioHora` y avisa que no queda historial.
+- En el Historial, editar horas escribe `HorasReales` (o `Duración(h)` si el Sheet es viejo); editar el
+  monto escribe `MontoCobrado` y `Total`.
+- Las vistas "Pendientes de cobro" y "A revisar" ignoran el filtro de mes/año para no esconder deudas viejas.
+
 ## Fase 1 — urgente
 
 ### Arreglos

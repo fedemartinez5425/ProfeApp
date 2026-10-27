@@ -333,3 +333,101 @@ def precio_hora_por_mes(df_clases):
          .groupby('Mes', as_index=False)[['Monto', 'Horas']].sum())
     g['PorHora'] = (g['Monto'] / g['Horas'].where(g['Horas'] > 0)).fillna(0.0)
     return g[['Mes', 'PorHora']]
+
+
+# ─────────────────────────────────────────────
+# EDICIÓN DEL HISTORIAL
+# ─────────────────────────────────────────────
+def tabla_editable_clases(df_clases):
+    """DataFrame para st.data_editor, indexado por ID_Clase."""
+    return pd.DataFrame({
+        'ID': df_clases['ID_Clase'].astype(int),
+        'Fecha': pd.Series([f.date() if not pd.isna(f) else None for f in df_clases['Fecha']],
+                           index=df_clases.index, dtype='object'),
+        'Alumno': df_clases['Alumno'],
+        'Materia': df_clases['Materia'],
+        'Horas': df_clases['Horas'].astype(float),
+        'Monto': df_clases['Monto'].astype(float),
+        '$/h': df_clases['PorHora'].astype(float),
+        'Pagada': df_clases['Pagada'].astype(bool),
+        'Método': df_clases['Método'],
+        'Revisar': df_clases['ARevisar'].astype(bool),
+        'Nota': df_clases['NotaRevision'],
+    }).set_index('ID')
+
+
+def _distinto(a, b):
+    if isinstance(a, float) or isinstance(b, float):
+        try:
+            a, b = float(a), float(b)
+        except (TypeError, ValueError):
+            return a != b
+        if math.isnan(a) and math.isnan(b):
+            return False
+        return abs(a - b) > 1e-9
+    if pd.isna(a) and pd.isna(b):
+        return False
+    return a != b
+
+
+def cambios_historial(original, editado, columnas_sheet):
+    """{ID_Clase: {columna_del_sheet: valor}} solo con las celdas que cambiaron.
+
+    Horas → HorasReales (o Duración(h) si el Sheet es viejo). Monto → MontoCobrado y Total.
+    """
+    columnas_sheet = set(columnas_sheet)
+    col_horas = 'HorasReales' if 'HorasReales' in columnas_sheet else 'Duración(h)'
+    resultado = {}
+    for id_clase, fila in editado.iterrows():
+        if id_clase not in original.index:
+            continue
+        orig = original.loc[id_clase]
+        cambios = {}
+        if _distinto(orig['Fecha'], fila['Fecha']) and not pd.isna(fila['Fecha']):
+            cambios['Fecha'] = pd.Timestamp(fila['Fecha']).date().isoformat()
+        if _distinto(orig['Horas'], fila['Horas']) and not pd.isna(fila['Horas']):
+            cambios[col_horas] = float(fila['Horas'])
+        if _distinto(orig['Monto'], fila['Monto']) and not pd.isna(fila['Monto']):
+            cambios['MontoCobrado'] = cambios['Total'] = float(fila['Monto'])
+        if _distinto(bool(orig['Pagada']), bool(fila['Pagada'])):
+            cambios['¿Pagada?'] = 'Sí' if fila['Pagada'] else 'No'
+        if _distinto(texto(orig['Método']), texto(fila['Método'])):
+            cambios['Método'] = texto(fila['Método'])
+        if _distinto(bool(orig['Revisar']), bool(fila['Revisar'])):
+            cambios['Revisar'] = 'Sí' if fila['Revisar'] else ''
+        if _distinto(texto(orig['Nota']), texto(fila['Nota'])):
+            cambios['NotaRevision'] = texto(fila['Nota'])
+        if cambios:
+            resultado[int(id_clase)] = cambios
+    return resultado
+
+
+def validar_cambios(cambios):
+    """Lista de errores (horas ≤ 0, montos negativos)."""
+    errores = []
+    for id_clase, c in cambios.items():
+        for col in ('HorasReales', 'Duración(h)'):
+            if col in c and c[col] <= 0:
+                errores.append(f"Clase #{id_clase}: las horas tienen que ser mayores a 0")
+        if 'MontoCobrado' in c and c['MontoCobrado'] < 0:
+            errores.append(f"Clase #{id_clase}: el monto no puede ser negativo")
+    return errores
+
+
+# ─────────────────────────────────────────────
+# AUMENTOS
+# ─────────────────────────────────────────────
+def plan_aumento(ids, modo, valor, desde, df_tarifas, df_alumnos, redondear_a=100):
+    """Tabla con la tarifa actual (vigente el día anterior a `desde`) y la nueva de cada alumno."""
+    desde = pd.Timestamp(desde).normalize()
+    nombres = nombres_por_id(df_alumnos)
+    filas = []
+    for id_alumno in ids:
+        actual, tipo, _ = tarifa_vigente(id_alumno, desde - pd.Timedelta(days=1), df_tarifas, df_alumnos)
+        nuevo = nuevo_monto_aumento(actual, modo, valor, redondear_a)
+        filas.append({
+            'ID_Alumno': int(id_alumno), 'Alumno': nombres.get(id_alumno, f"#{id_alumno}"), 'Tipo': tipo,
+            'Actual': actual, 'Nuevo': nuevo,
+            'Variación %': ((nuevo / actual - 1) * 100) if actual else None,
+        })
+    return pd.DataFrame(filas, columns=['ID_Alumno', 'Alumno', 'Tipo', 'Actual', 'Nuevo', 'Variación %'])

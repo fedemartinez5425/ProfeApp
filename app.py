@@ -9,11 +9,12 @@ import streamlit as st
 
 import sheets
 from logica import (
-    COLUMNAS_CLASES_NUEVAS, MESES, METODOS,
+    COLUMNAS_CLASES_NUEVAS, ESTADOS, MESES, METODOS,
     anios_disponibles, aplicar_nombres, clases_mismo_dia, columnas_faltantes,
-    filtrar_mes, format_currency, format_fecha, format_hours, monto_sugerido,
-    normalizar_alumnos, normalizar_clases, normalizar_tarifas, precio_hora_por_mes,
-    tarifa_vigente, ultima_tarifa_cargada,
+    cambios_historial, filtrar_mes, format_currency, format_fecha, format_hours, format_pct,
+    monto_sugerido, normalizar_alumnos, normalizar_clases, normalizar_tarifas, plan_aumento,
+    precio_hora_por_mes, tabla_editable_clases, tarifa_vigente, ultima_tarifa_cargada,
+    validar_cambios,
 )
 
 # ─────────────────────────────────────────────
@@ -216,10 +217,10 @@ def cargar_datos():
 
     df_alumnos = normalizar_alumnos(raw_alumnos)
     df_clases = aplicar_nombres(normalizar_clases(raw_clases), df_alumnos)
-    return df_clases, df_alumnos, df_tarifas, avisos
+    return df_clases, df_alumnos, df_tarifas, avisos, list(raw_clases.columns)
 
 
-df_clases, df_alumnos, df_tarifas, avisos = cargar_datos()
+df_clases, df_alumnos, df_tarifas, avisos, columnas_clases = cargar_datos()
 hoy = date.today()
 
 
@@ -267,11 +268,12 @@ if avisos:
         for a in avisos:
             st.markdown(f"- {a}")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab_tarifas, tab5 = st.tabs([
     "📊 Dashboard",
     "👨‍🎓 Alumnos",
     "📝 Registrar Clase",
     "💰 Historial",
+    "💲 Tarifas",
     "📈 Análisis"
 ])
 
@@ -435,6 +437,44 @@ with tab2:
             st.dataframe(vista, width="stretch", height=420, hide_index=True)
         else:
             st.info("No hay alumnos registrados aún →")
+
+        if not df_alumnos.empty:
+            st.markdown("#### ✏️ Editar ficha")
+            ids_ficha = df_alumnos.sort_values('Nombre')['ID_Alumno'].tolist()
+            id_f = st.selectbox("Alumno", ids_ficha, format_func=nombre_alumno, key="ficha_alumno")
+            af = df_alumnos[df_alumnos['ID_Alumno'] == id_f].iloc[0]
+            with st.form(f"ficha_{id_f}"):
+                c1, c2 = st.columns(2)
+                with c1:
+                    f_nombre = st.text_input("Nombre", value=af['Nombre'], key=f"ficha_nombre_{id_f}")
+                    f_tel = st.text_input("Teléfono", value=af['Teléfono'], key=f"ficha_tel_{id_f}")
+                with c2:
+                    f_estado = st.selectbox("Estado", ESTADOS, key=f"ficha_estado_{id_f}",
+                                            index=ESTADOS.index(af['Estado']) if af['Estado'] in ESTADOS else 0)
+                    f_contacto = st.text_input("Contacto / Responsable", value=af['Contacto'],
+                                               key=f"ficha_contacto_{id_f}")
+                f_obs = st.text_area("Observaciones", value=af['Observaciones'], height=68, key=f"ficha_obs_{id_f}")
+
+                if st.form_submit_button("💾 Guardar ficha", width="stretch"):
+                    nuevos = {'Nombre': f_nombre.strip(), 'Teléfono': f_tel.strip(), 'Estado': f_estado,
+                              'Contacto': f_contacto.strip(), 'Observaciones': f_obs.strip()}
+                    cambios = {c: v for c, v in nuevos.items() if v != af[c]}
+                    if not nuevos['Nombre']:
+                        st.error("El nombre es obligatorio")
+                    elif not cambios:
+                        st.info("No hay cambios para guardar.")
+                    else:
+                        try:
+                            ignoradas = sheets.actualizar(sheet, "Alumnos", id_f, cambios)
+                        except Exception as e:
+                            st.error(f"No se pudo guardar la ficha: {e}")
+                        else:
+                            guardadas = [c for c in cambios if c not in ignoradas]
+                            msg = f"✅ Ficha de {nuevos['Nombre']} actualizada: {', '.join(guardadas) or 'nada'}"
+                            if ignoradas:
+                                msg += f" · ⚠️ El Sheet no tiene las columnas {', '.join(ignoradas)}: no se guardaron"
+                            st.session_state["flash_alumno"] = msg
+                            st.rerun()
 
     with col2:
         st.markdown("#### ➕ Nuevo Alumno")
@@ -624,6 +664,12 @@ with tab3:
                     else:
                         ss["flash_clase"] = (f"✅ Clase #{nid} registrada: {ad['Nombre']}, {format_fecha(fecha)}, "
                                              f"{format_hours(horas)}, {format_currency(monto)}")
+                        if ad['Estado'] == 'Pausado':
+                            try:
+                                sheets.actualizar(sheet, "Alumnos", id_al, {'Estado': 'Activo'})
+                                ss["flash_clase"] += f" · {ad['Nombre']} volvió a Activo"
+                            except Exception as e:
+                                ss["flash_clase"] += f" · ⚠️ no se pudo pasar a Activo ({e})"
                         ss["reg_reset"] = id_al
                         st.rerun()
 
@@ -652,40 +698,94 @@ with tab4:
     if df_clases.empty:
         st.info("No hay clases registradas aún")
     else:
-        col1, col2, col3, col4, col5 = st.columns(5)
+        if st.session_state.get("flash_hist"):
+            st.success(st.session_state.pop("flash_hist"))
+
+        vista_rapida = st.radio("Vista rápida", ["Todas", "Pagadas", "Pendientes de cobro", "A revisar"],
+                                horizontal=True, key="hist_vista")
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
-            ids_hist = (df_clases.drop_duplicates('ID_Alumno').sort_values('Alumno')['ID_Alumno'].tolist())
-            nombres_hist = dict(zip(df_clases['ID_Alumno'], df_clases['Alumno']))
-            f_alumno = st.multiselect("Alumno", ids_hist, format_func=lambda i: nombres_hist.get(i, f"#{i}"))
+            ids_hist = sorted(df_clases['ID_Alumno'].unique().tolist(), key=lambda i: nombre_alumno(i).lower())
+            f_alumno = st.multiselect("Alumno", ids_hist, format_func=nombre_alumno, key="hist_alumnos")
         with col2:
-            f_materia = st.multiselect("Materia", sorted(df_clases['Materia'].unique()))
+            f_materia = st.multiselect("Materia", sorted(df_clases['Materia'].unique()), key="hist_materias")
         with col3:
-            f_pago = st.selectbox("Estado de pago", ["Todas", "Pagadas", "Pendientes"])
-        with col4:
             f_mes = st.selectbox("Mes", ['Todos'] + MESES, key="hist_mes")
-        with col5:
+        with col4:
             anios_h = anios_disponibles(df_clases, hoy)
             f_anio = st.selectbox("Año", ['Todos'] + anios_h, index=1 + anios_h.index(hoy.year), key="hist_anio")
 
         df_f = df_clases.copy()
         if f_alumno:  df_f = df_f[df_f['ID_Alumno'].isin(f_alumno)]
         if f_materia: df_f = df_f[df_f['Materia'].isin(f_materia)]
-        if f_pago == "Pagadas":    df_f = df_f[df_f['Pagada']]
-        if f_pago == "Pendientes": df_f = df_f[~df_f['Pagada']]
-        if f_anio != 'Todos':
-            df_f = df_f[df_f['Fecha'].dt.year == f_anio]
-        if f_mes != 'Todos':
-            df_f = df_f[df_f['Fecha'].dt.month == MESES.index(f_mes) + 1]
+        if vista_rapida == "Pagadas":             df_f = df_f[df_f['Pagada']]
+        if vista_rapida == "Pendientes de cobro": df_f = df_f[~df_f['Pagada']]
+        if vista_rapida == "A revisar":           df_f = df_f[df_f['ARevisar']]
+        # Los filtros rápidos de pendientes y revisión miran todos los meses
+        if vista_rapida in ("Todas", "Pagadas"):
+            if f_anio != 'Todos':
+                df_f = df_f[df_f['Fecha'].dt.year == f_anio]
+            if f_mes != 'Todos':
+                df_f = df_f[df_f['Fecha'].dt.month == MESES.index(f_mes) + 1]
+        else:
+            st.caption("Esta vista muestra todos los meses y años.")
 
-        # Tabla
-        df_disp = df_f.sort_values(['Fecha', 'ID_Clase'], ascending=False).copy()
-        df_disp['Fecha'] = df_disp['Fecha'].apply(format_fecha)
-        df_disp['Monto cobrado'] = df_disp['Monto'].apply(format_currency)
-        df_disp['Horas reales'] = df_disp['Horas'].apply(format_hours)
-        df_disp['$/h efectivo'] = df_disp['PorHora'].apply(format_currency)
-        st.dataframe(df_disp[['ID_Clase', 'Fecha', 'Alumno', 'Materia', 'Horas reales', 'Monto cobrado',
-                              '$/h efectivo', '¿Pagada?', 'Método', 'Revisar', 'NotaRevision']],
-                     width="stretch", height=380, hide_index=True)
+        # Tabla editable: solo se escriben las celdas que cambian, fila por fila (por ID_Clase)
+        df_f = df_f.sort_values(['Fecha', 'ID_Clase'], ascending=False)
+        # Filas con ID vacío o repetido no se pueden editar ni borrar con seguridad: se muestran aparte
+        id_malo = df_f['ID_Clase'].duplicated(keep=False) | (df_f['ID_Clase'] == 0)
+        if id_malo.any():
+            st.warning("⚠️ Estas filas del Sheet tienen `ID_Clase` vacío o repetido. No se pueden editar ni borrar "
+                       "desde la app hasta que les pongas un ID único en el Sheet:")
+            st.dataframe(df_f[id_malo][['ID_Clase', 'Fecha', 'Alumno', 'Horas', 'Monto']], hide_index=True)
+        df_ed = df_f[~id_malo]
+        original = tabla_editable_clases(df_ed)
+        metodos = sorted(set(METODOS) | set(original['Método'].dropna()) - {''})
+        version = st.session_state.get("hist_version", 0)
+        # La key incluye las filas mostradas: si cambia el filtro, las ediciones sin guardar no saltan de fila
+        firma_filas = abs(hash(tuple(sorted(original.index)))) % 10**8
+        sin_revision = [c for c, col in (('Revisar', 'Revisar'), ('Nota', 'NotaRevision'))
+                        if col not in columnas_clases]
+        editado = st.data_editor(
+            original, key=f"hist_editor_{version}_{firma_filas}", height=380, width="stretch",
+            disabled=['Alumno', 'Materia', '$/h'] + sin_revision,
+            column_config={
+                'Fecha': st.column_config.DateColumn('Fecha', format='DD/MM/YYYY', required=True),
+                'Horas': st.column_config.NumberColumn('Horas reales', min_value=0.25, step=0.25, format='%.2f'),
+                'Monto': st.column_config.NumberColumn('Monto cobrado', min_value=0, step=500, format='localized'),
+                '$/h': st.column_config.NumberColumn('$/h efectivo', format='localized'),
+                'Pagada': st.column_config.CheckboxColumn('¿Pagada?'),
+                'Método': st.column_config.SelectboxColumn('Método', options=metodos),
+                'Revisar': st.column_config.CheckboxColumn('Revisar'),
+                'Nota': st.column_config.TextColumn('Nota de revisión'),
+            },
+        )
+        cambios = cambios_historial(original, editado, columnas_clases)
+        if cambios:
+            errores = validar_cambios(cambios)
+            for e in errores:
+                st.error(e)
+            g1, g2 = st.columns([1, 1])
+            if g1.button(f"💾 Guardar cambios ({len(cambios)} clase{'s' if len(cambios) > 1 else ''})",
+                         type="primary", disabled=bool(errores), key="hist_guardar"):
+                hechos, fallas = [], []
+                for id_clase, c in cambios.items():
+                    try:
+                        sheets.actualizar(sheet, "Clases", id_clase, c)
+                        hechos.append(id_clase)
+                    except Exception as e:
+                        fallas.append(f"#{id_clase}: {e}")
+                msg = f"✅ Guardadas {len(hechos)} clase(s): " + ", ".join(f"#{i}" for i in hechos)
+                if fallas:
+                    # Sin cambiar la versión: las ediciones que fallaron siguen en pantalla para reintentar
+                    msg += " · ⚠️ Fallaron: " + "; ".join(fallas)
+                else:
+                    st.session_state["hist_version"] = version + 1
+                st.session_state["flash_hist"] = msg
+                st.rerun()
+            if g2.button("↺ Descartar cambios", key="hist_descartar"):
+                st.session_state["hist_version"] = version + 1
+                st.rerun()
 
         # Resumen
         st.markdown("---")
@@ -694,6 +794,149 @@ with tab4:
         r2.metric("💰 Facturado",     format_currency(df_f['Monto'].sum()))
         r3.metric("✅ Cobrado",        format_currency(df_f[df_f['Pagada']]['Monto'].sum()))
         r4.metric("⏳ Pendiente",      format_currency(df_f[~df_f['Pagada']]['Monto'].sum()))
+
+        # Borrado de una clase, con confirmación
+        with st.expander("🗑️ Borrar una clase"):
+            ids_borrar = df_ed['ID_Clase'].tolist()
+            if st.session_state.get("hist_borrar_id") not in ids_borrar:
+                st.session_state.pop("hist_borrar_id", None)
+            if not ids_borrar:
+                st.info("No hay clases en el filtro actual.")
+            else:
+                filas_b = df_ed.set_index('ID_Clase')
+                id_b = st.selectbox(
+                    "Clase", ids_borrar, key="hist_borrar_id",
+                    format_func=lambda i: (f"#{i} · {format_fecha(filas_b.loc[i, 'Fecha'])} · "
+                                           f"{filas_b.loc[i, 'Alumno']} · {format_hours(filas_b.loc[i, 'Horas'])} · "
+                                           f"{format_currency(filas_b.loc[i, 'Monto'])}"))
+                ok_b = st.checkbox(f"Sí, borrar la clase #{id_b} del Sheet (no se puede deshacer)",
+                                   key=f"hist_borrar_ok_{id_b}")
+                if st.button("🗑️ Borrar", disabled=not ok_b, key="hist_borrar"):
+                    try:
+                        sheets.borrar(sheet, "Clases", id_b)
+                    except Exception as e:
+                        st.error(f"No se pudo borrar: {e}")
+                    else:
+                        st.session_state["hist_version"] = version + 1
+                        st.session_state["flash_hist"] = f"🗑️ Clase #{id_b} borrada"
+                        st.rerun()
+
+# ═══════════════════════════════════════════════
+# TAB · TARIFAS
+# ═══════════════════════════════════════════════
+with tab_tarifas:
+    st.markdown('<p class="section-header">💲 Tarifas y aumentos</p>', unsafe_allow_html=True)
+    st.markdown('<p class="section-sub">Historial de precios por alumno y aumentos</p>', unsafe_allow_html=True)
+
+    if st.session_state.get("flash_tarifas"):
+        st.success(st.session_state.pop("flash_tarifas"))
+    if df_tarifas is None:
+        st.warning("No existe la hoja **Tarifas**: los aumentos solo actualizan el `PrecioHora` de la ficha y no "
+                   "queda historial. Para crearla, importá la hoja Tarifas del Excel corregido.")
+
+    if df_alumnos.empty:
+        st.info("No hay alumnos registrados aún.")
+    else:
+        ids_tar = df_alumnos[df_alumnos['Estado'] != 'Baja'].sort_values('Nombre')['ID_Alumno'].tolist()
+        col1, col2 = st.columns([1, 1])
+
+        with col1:
+            st.markdown("#### 📜 Historial por alumno")
+            id_t = st.selectbox("Alumno", df_alumnos.sort_values('Nombre')['ID_Alumno'].tolist(),
+                                format_func=nombre_alumno, key="tar_alumno")
+            vig, tipo_vig, origen_vig = tarifa_vigente(id_t, hoy, df_tarifas, df_alumnos)
+            st.metric(f"Tarifa vigente hoy (origen: {origen_vig.lower()})",
+                      f"{format_currency(vig)} / {tipo_vig.lower()}")
+            if df_tarifas is not None:
+                h = df_tarifas[df_tarifas['ID_Alumno'] == id_t].sort_values(['Desde', 'ID_Tarifa'], ascending=False)
+                if h.empty:
+                    st.info("Sin tarifas cargadas: se usa el precio de la ficha.")
+                else:
+                    st.dataframe(pd.DataFrame({
+                        'Desde': h['Desde'].apply(format_fecha),
+                        'Tipo': h['Tipo'],
+                        'Monto': h['Monto'].apply(format_currency),
+                        'Nota': h['Nota'],
+                    }), width="stretch", hide_index=True)
+
+        with col2:
+            st.markdown("#### 📈 Aplicar aumento")
+            alcance = st.radio("A quién", ["Todos los activos", "Elegir alumnos"], horizontal=True, key="aum_alcance")
+            if alcance == "Elegir alumnos":
+                ids_aum = st.multiselect("Alumnos", ids_tar, format_func=nombre_alumno, key="aum_alumnos")
+            else:
+                ids_aum = df_alumnos[df_alumnos['Estado'] == 'Activo']['ID_Alumno'].tolist()
+            modo = st.radio("Cómo", ["Porcentaje", "Monto nuevo"], horizontal=True, key="aum_modo")
+            if modo == "Porcentaje":
+                valor = st.number_input("Aumento (%)", min_value=-50.0, max_value=500.0, value=10.0, step=1.0,
+                                        key="aum_pct")
+                redondear = st.checkbox("Redondear a $ 100", value=True, key="aum_redondear")
+            else:
+                valor = st.number_input("Monto nuevo ($)", min_value=0.0, step=500.0, format="%.0f", key="aum_monto",
+                                        value=float(ultima_tarifa_cargada(df_tarifas, df_alumnos)))
+                redondear = False
+            desde = st.date_input("Desde", value=hoy, format="DD/MM/YYYY", key="aum_desde")
+            nota = st.text_input("Nota", value="aumento", key="aum_nota")
+
+            plan = plan_aumento(ids_aum, 'pct' if modo == "Porcentaje" else 'monto', valor, desde,
+                                df_tarifas, df_alumnos, 100 if redondear else 0)
+            if plan.empty:
+                st.info("Elegí al menos un alumno.")
+            else:
+                st.dataframe(pd.DataFrame({
+                    'Alumno': plan['Alumno'],
+                    'Actual': plan['Actual'].apply(format_currency),
+                    'Nuevo': plan['Nuevo'].apply(format_currency),
+                    'Variación': plan['Variación %'].apply(lambda v: format_pct(v) if pd.notna(v) else '—'),
+                    'Tipo': plan['Tipo'],
+                }), width="stretch", hide_index=True)
+                if desde > hoy:
+                    st.caption("Empieza a regir en el futuro: hasta esa fecha se sigue usando la tarifa actual, y el "
+                               "`PrecioHora` de la ficha no se toca.")
+                sin_donde_guardar = df_tarifas is None and desde > hoy
+                if sin_donde_guardar:
+                    st.error("Sin hoja Tarifas no se puede programar un aumento a futuro: elegí una fecha de hoy "
+                             "o anterior, o creá la hoja Tarifas.")
+                version_aum = st.session_state.get("aum_version", 0)
+                ok_aum = st.checkbox(f"Confirmo el aumento para {len(plan)} alumno(s) desde {format_fecha(desde)}",
+                                     key=f"aum_ok_{version_aum}")
+                if st.button("✅ Aplicar aumento", type="primary", disabled=not ok_aum or sin_donde_guardar,
+                             key="aum_aplicar"):
+                    firma = (tuple(plan['ID_Alumno']), tuple(plan['Nuevo']), desde.isoformat())
+                    previo = st.session_state.get("aum_ultimo")
+                    if previo and previo[0] == firma and time.time() - previo[1] < 30:
+                        st.info("Ese aumento ya se aplicó recién (se ignoró el doble clic).")
+                    else:
+                        hechos, fallas, avisos_aum = [], [], []
+                        for _, r in plan.iterrows():
+                            if df_tarifas is not None:
+                                try:
+                                    sheets.agregar(sheet, "Tarifas", {
+                                        'ID_Alumno': int(r['ID_Alumno']), 'Desde': desde.isoformat(),
+                                        'Tipo': r['Tipo'], 'Monto': float(r['Nuevo']), 'Nota': nota.strip(),
+                                    })
+                                except Exception as e:
+                                    fallas.append(f"{r['Alumno']}: no se creó la tarifa ({e})")
+                                    continue
+                            # PrecioHora es precio por hora: no se pisa con una cuota por clase o mensual
+                            if desde <= hoy and r['Tipo'] == 'Hora':
+                                try:
+                                    sheets.actualizar(sheet, "Alumnos", int(r['ID_Alumno']),
+                                                      {'PrecioHora': float(r['Nuevo'])})
+                                except Exception as e:
+                                    avisos_aum.append(f"{r['Alumno']}: tarifa creada pero no se actualizó la "
+                                                      f"ficha ({e}); no lo vuelvas a aplicar")
+                            hechos.append(r['Alumno'])
+                        if hechos:
+                            st.session_state["aum_ultimo"] = (firma, time.time())
+                        st.session_state["aum_version"] = version_aum + 1
+                        msg = f"✅ Aumento aplicado a {len(hechos)} alumno(s): {', '.join(hechos)}"
+                        if avisos_aum:
+                            msg += " · ⚠️ " + "; ".join(avisos_aum)
+                        if fallas:
+                            msg += " · ⚠️ Fallaron: " + "; ".join(fallas)
+                        st.session_state["flash_tarifas"] = msg
+                        st.rerun()
 
 # ═══════════════════════════════════════════════
 # TAB 5 · ANÁLISIS

@@ -3,12 +3,14 @@
 Reglas:
 - Las columnas se mapean por nombre de encabezado, nunca por posición fija.
 - Escritura siempre con value_input_option=RAW (la planilla es es-AR).
-- Nunca se borra ni reescribe una hoja entera: alta = append_row.
+- Nunca se borra ni reescribe una hoja entera: alta = append_row, edición = celdas de la fila
+  del ID, borrado = delete_rows de la fila buscada por ID justo antes.
 - Después de cada escritura se invalida la caché de lectura.
 """
 import gspread
 import streamlit as st
 from google.oauth2.service_account import Credentials
+from gspread.cell import Cell
 from gspread.utils import ValueInputOption, ValueRenderOption
 
 from logica import ID_COLUMNA, filas_a_df, normalizar_texto, parse_id
@@ -90,3 +92,37 @@ def agregar(sheet, hoja, fila):
     invalidar_cache()
     ignoradas = [k for k in fila if k not in headers]
     return fila.get(col_id), ignoradas
+
+
+def _fila_de_id(ws, headers, hoja, id_):
+    """Número de fila (1-based) del ID, buscado en el momento. Error si no está o está repetido."""
+    col_id = ID_COLUMNA[hoja]
+    if col_id not in headers:
+        raise KeyError(f"La hoja {hoja} no tiene la columna {col_id}")
+    ids = ws.col_values(headers.index(col_id) + 1, value_render_option=ValueRenderOption.unformatted)
+    filas = [i for i, v in enumerate(ids, start=1) if i > 1 and parse_id(v) == int(id_)]
+    if not filas:
+        raise KeyError(f"No existe {col_id} = {id_} en {hoja}")
+    if len(filas) > 1:
+        raise ValueError(f"{col_id} = {id_} está repetido en {hoja} (filas {filas}); corregilo en el Sheet")
+    return filas[0]
+
+
+def actualizar(sheet, hoja, id_, cambios):
+    """Actualiza solo las celdas indicadas de la fila de ese ID. Devuelve las columnas ignoradas."""
+    ws = _hoja(sheet, hoja)
+    headers = _encabezados(ws)
+    fila = _fila_de_id(ws, headers, hoja, id_)
+    celdas = [Cell(fila, headers.index(c) + 1, _a_celda(v)) for c, v in cambios.items() if c in headers]
+    if celdas:
+        ws.update_cells(celdas, value_input_option=ValueInputOption.raw)
+        invalidar_cache()
+    return [c for c in cambios if c not in headers]
+
+
+def borrar(sheet, hoja, id_):
+    """Borra la fila de ese ID (buscada justo antes de borrar)."""
+    ws = _hoja(sheet, hoja)
+    fila = _fila_de_id(ws, _encabezados(ws), hoja, id_)
+    ws.delete_rows(fila)
+    invalidar_cache()
