@@ -162,8 +162,6 @@ if not st.session_state.get("autorizado", False):
     with col2:
         st.markdown("<br><br>", unsafe_allow_html=True)
         st.markdown('<p class="section-header" style="text-align: center;">🔒 Acceso Restringido</p>', unsafe_allow_html=True)
-        if not PASSWORD_APP:
-            st.error(AVISO_PASSWORD)
         with st.form("login_form"):
             pwd = st.text_input("Contraseña de acceso", type="password")
             submit = st.form_submit_button("Ingresar", width="stretch")
@@ -466,15 +464,20 @@ with tab2:
                             'Modalidad': modalidad, 'FechaAlta': alta,
                             'Estado': 'Activo', 'Observaciones': obs.strip()
                         })
-                        if df_tarifas is not None:
-                            sheets.agregar(sheet, "Tarifas", {
-                                'ID_Alumno': nid, 'Desde': alta, 'Tipo': 'Hora',
-                                'Monto': float(precio_hora), 'Nota': 'alta'
-                            })
                     except Exception as e:
                         st.error(f"No se pudo guardar el alumno: {e}")
                     else:
-                        st.session_state["flash_alumno"] = f"✅ {nombre.strip()} agregado correctamente"
+                        mensaje = f"✅ {nombre.strip()} agregado correctamente (#{nid})"
+                        if df_tarifas is not None:
+                            try:
+                                sheets.agregar(sheet, "Tarifas", {
+                                    'ID_Alumno': nid, 'Desde': alta, 'Tipo': 'Hora',
+                                    'Monto': float(precio_hora), 'Nota': 'alta'
+                                })
+                            except Exception as e:
+                                mensaje += (f". ⚠️ No se pudo crear su tarifa ({e}); se usa el precio de la "
+                                            "ficha. No lo vuelvas a agregar.")
+                        st.session_state["flash_alumno"] = mensaje
                         st.rerun()
 
 # ═══════════════════════════════════════════════
@@ -493,7 +496,7 @@ with tab3:
     # Limpieza diferida de los campos del alumno recién guardado (antes de crear los widgets)
     reset_id = ss.pop("reg_reset", None)
     if reset_id is not None:
-        for n in ["fecha", "horas", "tarifa", "tarifa_manual", "monto", "monto_manual", "dup_ok"]:
+        for n in ["fecha", "horas", "tarifa", "tarifa_manual", "monto", "monto_manual", "dup_ok", "cero_ok"]:
             ss.pop(f"reg_{n}_{reset_id}", None)
 
     df_sel = df_alumnos[df_alumnos['Estado'] != 'Baja'].copy() if not df_alumnos.empty else df_alumnos
@@ -530,7 +533,10 @@ with tab3:
                 ultimas = clases_al.sort_values(['Fecha', 'ID_Clase'])['Horas'] if not clases_al.empty else []
                 ultima = float(ultimas.iloc[-1]) if len(ultimas) else 0.0
                 ss[k("horas")] = min(max(ultima, 0.25), 12.0) if ultima > 0 else 1.5
-            if not ss.get(k("tarifa_manual")):
+            # Streamlit borra el valor de un widget que no se dibujó (al cambiar de alumno), pero no
+            # los flags "manual": si el valor ya no está, se vuelve al cálculo automático.
+            if not ss.get(k("tarifa_manual")) or k("tarifa") not in ss:
+                ss[k("tarifa_manual")] = False
                 ss[k("tarifa")] = float(tarifa_v)
 
             unidad = {'Hora': 'hora', 'Clase': 'clase', 'Mensual': 'mes'}.get(tipo_v, 'hora')
@@ -546,7 +552,8 @@ with tab3:
                        f"(origen: {origen_v.lower()})")
 
             sugerido = monto_sugerido(horas, tarifa, tipo_v)
-            if not ss.get(k("monto_manual")):
+            if not ss.get(k("monto_manual")) or k("monto") not in ss:
+                ss[k("monto_manual")] = False
                 ss[k("monto")] = float(sugerido)
             monto = st.number_input("Monto cobrado ($) *", min_value=0.0, step=500.0, format="%.0f",
                                     key=k("monto"), on_change=marcar, args=(k("monto_manual"),),
@@ -582,6 +589,10 @@ with tab3:
                                   for _, r in dups.iterrows())
                 st.warning(f"⚠️ Ya hay {len(dups)} clase(s) de {ad['Nombre']} el {format_fecha(fecha)}: {lista}.")
                 confirmado = st.checkbox("Es otra clase, guardar igual", key=k("dup_ok"))
+            if monto <= 0:
+                st.warning("⚠️ El monto cobrado es $ 0." + (" Con tarifa mensual, cargá el abono en la clase que "
+                           "corresponda." if tipo_v == 'Mensual' else " Si de verdad no cobraste, confirmalo."))
+                confirmado = st.checkbox("Guardar con monto $ 0", key=k("cero_ok")) and confirmado
 
             if st.button("✅ Registrar Clase", type="primary", width="stretch",
                          disabled=not confirmado, key="reg_guardar"):
@@ -643,7 +654,9 @@ with tab4:
     else:
         col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
-            f_alumno = st.multiselect("Alumno", sorted(df_clases['Alumno'].unique()))
+            ids_hist = (df_clases.drop_duplicates('ID_Alumno').sort_values('Alumno')['ID_Alumno'].tolist())
+            nombres_hist = dict(zip(df_clases['ID_Alumno'], df_clases['Alumno']))
+            f_alumno = st.multiselect("Alumno", ids_hist, format_func=lambda i: nombres_hist.get(i, f"#{i}"))
         with col2:
             f_materia = st.multiselect("Materia", sorted(df_clases['Materia'].unique()))
         with col3:
@@ -655,7 +668,7 @@ with tab4:
             f_anio = st.selectbox("Año", ['Todos'] + anios_h, index=1 + anios_h.index(hoy.year), key="hist_anio")
 
         df_f = df_clases.copy()
-        if f_alumno:  df_f = df_f[df_f['Alumno'].isin(f_alumno)]
+        if f_alumno:  df_f = df_f[df_f['ID_Alumno'].isin(f_alumno)]
         if f_materia: df_f = df_f[df_f['Materia'].isin(f_materia)]
         if f_pago == "Pagadas":    df_f = df_f[df_f['Pagada']]
         if f_pago == "Pendientes": df_f = df_f[~df_f['Pagada']]
@@ -736,7 +749,8 @@ with tab5:
 
         # ── Bloque 2: Ingreso mensual por alumno (stacked) ──
         st.markdown("#### 💹 Ingresos Mensuales por Alumno")
-        pivot = df_an.groupby(['Mes', 'Alumno'], as_index=False)['Monto'].sum()
+        pivot = (df_an.groupby(['Mes', 'ID_Alumno'], as_index=False)
+                 .agg(Alumno=('Alumno', 'last'), Monto=('Monto', 'sum')))
         fig_stack = px.bar(
             pivot, x='Mes', y='Monto', color='Alumno',
             barmode='stack',

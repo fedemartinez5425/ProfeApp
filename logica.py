@@ -95,7 +95,7 @@ def parse_fecha(val):
         return pd.to_datetime(s[:10], format='%Y-%m-%d', errors='coerce')
     if re.match(r'^\d{1,2}/\d{1,2}/\d{4}$', s):
         return pd.to_datetime(s, format='%d/%m/%Y', errors='coerce')
-    return pd.to_datetime(s, errors='coerce')
+    return pd.NaT
 
 
 def parse_id(val):
@@ -205,10 +205,14 @@ def normalizar_alumnos(df):
     df['ID_Alumno'] = df['ID_Alumno'].apply(parse_id)
     df['PrecioHora'] = pd.to_numeric(df['PrecioHora'].apply(parse_numero, tipo='dinero'),
                                      errors='coerce').fillna(0.0)
+    alta_cruda = df['FechaAlta'].copy()
     for c in ['Nombre', 'Materia', 'Curso', 'Teléfono', 'Contacto', 'Día', 'Frecuencia',
               'Modalidad', 'FechaAlta', 'Estado', 'Observaciones']:
         df[c] = df[c].apply(texto)
     df.loc[df['Estado'] == '', 'Estado'] = 'Activo'
+    # FechaAlta puede venir como texto ISO, dd/mm/aaaa o número de serie: se normaliza a ISO
+    alta = alta_cruda.apply(parse_fecha)
+    df['FechaAlta'] = [f.date().isoformat() if not pd.isna(f) else t for f, t in zip(alta, df['FechaAlta'])]
     return df
 
 
