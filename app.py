@@ -1,10 +1,20 @@
-import streamlit as st
+import hmac
+import time
+from datetime import date, datetime
+
 import pandas as pd
-import gspread
-from google.oauth2.service_account import Credentials
-from datetime import datetime
 import plotly.express as px
 import plotly.graph_objects as go
+import streamlit as st
+
+import sheets
+from logica import (
+    COLUMNAS_CLASES_NUEVAS, MESES, METODOS,
+    anios_disponibles, aplicar_nombres, clases_mismo_dia, columnas_faltantes,
+    filtrar_mes, format_currency, format_fecha, format_hours, monto_sugerido,
+    normalizar_alumnos, normalizar_clases, normalizar_tarifas, precio_hora_por_mes,
+    tarifa_vigente, ultima_tarifa_cargada,
+)
 
 # ─────────────────────────────────────────────
 # CONFIGURACIÓN DE PÁGINA
@@ -133,113 +143,96 @@ section[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,0.2); }
 # ─────────────────────────────────────────────
 # LOGIN / SISTEMA CERRADO
 # ─────────────────────────────────────────────
+# Respaldo para no quedar afuera de producción mientras no exista el secret app_password.
+PASSWORD_RESPALDO = "tu_contraseña_aqui"
+
+
+def password_configurada():
+    try:
+        return st.secrets.get("app_password")
+    except Exception:
+        return None
+
+
+PASSWORD_APP = password_configurada()
+AVISO_PASSWORD = "🔴 Configurá app_password en Secrets (Streamlit Cloud → Settings → Secrets)."
+
 if not st.session_state.get("autorizado", False):
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         st.markdown("<br><br>", unsafe_allow_html=True)
         st.markdown('<p class="section-header" style="text-align: center;">🔒 Acceso Restringido</p>', unsafe_allow_html=True)
+        if not PASSWORD_APP:
+            st.error(AVISO_PASSWORD)
         with st.form("login_form"):
             pwd = st.text_input("Contraseña de acceso", type="password")
-            submit = st.form_submit_button("Ingresar", use_container_width=True)
-            
+            submit = st.form_submit_button("Ingresar", width="stretch")
+
             if submit:
-                if pwd == "tu_contraseña_aqui":
+                esperada = PASSWORD_APP or PASSWORD_RESPALDO
+                if hmac.compare_digest(pwd.encode(), str(esperada).encode()):
                     st.session_state["autorizado"] = True
                     st.rerun()
                 else:
                     st.error("Contraseña incorrecta.")
     st.stop()
 
-# ─────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────
-def parse_numeric(val):
-    """Convierte valores con coma o punto decimal correctamente."""
-    if pd.isna(val) or val == '':
-        return 0.0
-    s = str(val).strip()
-    # Si tiene coma Y punto, el separador de miles es el primero
-    if ',' in s and '.' in s:
-        if s.index(',') < s.index('.'):
-            s = s.replace(',', '')          # 1,234.56 → 1234.56
-        else:
-            s = s.replace('.', '').replace(',', '.')  # 1.234,56 → 1234.56
-    elif ',' in s:
-        s = s.replace(',', '.')            # 1,5 → 1.5
-    try:
-        return float(s)
-    except ValueError:
-        return 0.0
-
-def format_currency(amount):
-    try:
-        amount = float(amount)
-    except:
-        amount = 0.0
-    formatted = f"{amount:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    return f"$ {formatted}"
-
-def format_hours(h):
-    try:
-        h = float(h)
-    except:
-        h = 0.0
-    return f"{h:.1f}h".replace(".", ",")
-
-# ─────────────────────────────────────────────
-# GOOGLE SHEETS
-# ─────────────────────────────────────────────
-@st.cache_resource
-def get_google_sheet():
-    try:
-        credentials_dict = dict(st.secrets["gcp_service_account"])
-        spreadsheet_name = st.secrets["spreadsheet"]["name"]
-        scopes = [
-            'https://www.googleapis.com/auth/spreadsheets',
-            'https://www.googleapis.com/auth/drive'
-        ]
-        creds = Credentials.from_service_account_info(credentials_dict, scopes=scopes)
-        client = gspread.authorize(creds)
-        return client.open(spreadsheet_name)
-    except Exception as e:
-        st.error(f"❌ Error al conectar con Google Sheets: {str(e)}")
-        return None
-
-@st.cache_data(ttl=30)
-def load_data(_sheet, worksheet_name):
-    try:
-        ws = _sheet.worksheet(worksheet_name)
-        data = ws.get_all_records()
-        df = pd.DataFrame(data)
-        if not df.empty:
-            df.columns = df.columns.str.strip()
-            for col in ['Total', 'PrecioHora']:
-                if col in df.columns:
-                    df[col] = df[col].apply(parse_numeric)
-            if 'Duración(h)' in df.columns:
-                df['Duración(h)'] = df['Duración(h)'].apply(parse_numeric)
-            for col in ['ID_Clase', 'ID_Alumno']:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
-        return df
-    except Exception as e:
-        st.error(f"Error al cargar {worksheet_name}: {str(e)}")
-        return pd.DataFrame()
-
-def save_data(sheet, worksheet_name, df):
-    try:
-        ws = sheet.worksheet(worksheet_name)
-        ws.clear()
-        df_clean = df.fillna('').astype(str).replace('nan', '').replace('None', '')
-        data = [df_clean.columns.values.tolist()] + df_clean.values.tolist()
-        ws.update('A1', data)
-        load_data.clear()
-        return True
-    except Exception as e:
-        st.error(f"Error al guardar en {worksheet_name}: {str(e)}")
-        return False
-
 MATERIAS = ["Matemática", "Física", "Economía", "Estadística", "Matemática Financiera"]
+
+# ─────────────────────────────────────────────
+# CONEXIÓN Y CARGA DE DATOS
+# ─────────────────────────────────────────────
+sheet = sheets.conectar()
+
+if not sheet:
+    st.error("❌ No se pudo conectar con Google Sheets. Verifica Streamlit Secrets.")
+    st.stop()
+
+
+def cargar_datos():
+    """Lee las hojas y las normaliza. Funciona con el Sheet viejo y con el nuevo."""
+    avisos = []
+    raw_clases = sheets.leer(sheet, "Clases")
+    raw_alumnos = sheets.leer(sheet, "Alumnos")
+    raw_tarifas = sheets.leer(sheet, "Tarifas")
+
+    if raw_clases is None:
+        avisos.append("No existe la hoja **Clases**: se muestra todo vacío.")
+        raw_clases = pd.DataFrame()
+    elif not raw_clases.empty:
+        faltan = columnas_faltantes(raw_clases, COLUMNAS_CLASES_NUEVAS)
+        if faltan:
+            avisos.append(f"La hoja **Clases** no tiene las columnas {', '.join(faltan)}: se usan "
+                          "`Total` y `Duración(h)`. Importá el Excel corregido para agregarlas.")
+    if raw_alumnos is None:
+        avisos.append("No existe la hoja **Alumnos**.")
+        raw_alumnos = pd.DataFrame()
+
+    df_tarifas = None
+    if raw_tarifas is None:
+        avisos.append("No existe la hoja **Tarifas**: se usa el `PrecioHora` de cada ficha. Para crearla, "
+                      "importá la hoja Tarifas del Excel corregido (Archivo → Importar → Subir → "
+                      "*Insertar hojas nuevas*).")
+    else:
+        df_tarifas = normalizar_tarifas(raw_tarifas)
+
+    df_alumnos = normalizar_alumnos(raw_alumnos)
+    df_clases = aplicar_nombres(normalizar_clases(raw_clases), df_alumnos)
+    return df_clases, df_alumnos, df_tarifas, avisos
+
+
+df_clases, df_alumnos, df_tarifas, avisos = cargar_datos()
+hoy = date.today()
+
+
+def nombre_alumno(id_alumno):
+    fila = df_alumnos[df_alumnos['ID_Alumno'] == id_alumno]
+    return fila.iloc[0]['Nombre'] if not fila.empty else f"Alumno #{id_alumno}"
+
+
+def marcar(clave):
+    st.session_state[clave] = True
+
 
 # ─────────────────────────────────────────────
 # SIDEBAR
@@ -248,43 +241,33 @@ with st.sidebar:
     st.markdown("## 📚 ProfeApp")
     st.markdown("### Federico Luis Martínez")
     st.markdown("---")
-    
-    # Mini stats en sidebar
-    sheet_sidebar = get_google_sheet()
-    if sheet_sidebar:
-        df_sb = load_data(sheet_sidebar, "Clases")
-        if not df_sb.empty:
-            df_sb['Fecha'] = pd.to_datetime(df_sb['Fecha'], errors='coerce')
-            mes_now = datetime.now().month
-            año_now = datetime.now().year
-            df_mes_sb = df_sb[(df_sb['Fecha'].dt.month == mes_now) & (df_sb['Fecha'].dt.year == año_now)]
-            
-            st.markdown("**📅 Este mes**")
-            st.markdown(f"💰 **{format_currency(df_mes_sb['Total'].sum())}**")
-            st.markdown(f"📚 {len(df_mes_sb)} clases · {format_hours(df_mes_sb['Duración(h)'].sum())} dictadas")
-            
-            pendientes = df_sb[df_sb['¿Pagada?'] == 'No']['Total'].sum()
-            if pendientes > 0:
-                st.markdown("---")
-                st.markdown(f"⚠️ **Pendiente de cobro:**")
-                st.markdown(f"🔴 **{format_currency(pendientes)}**")
-    
+
+    if not df_clases.empty:
+        df_mes_sb = filtrar_mes(df_clases, hoy.month, hoy.year)
+        st.markdown("**📅 Este mes**")
+        st.markdown(f"💰 **{format_currency(df_mes_sb['Monto'].sum())}**")
+        st.markdown(f"📚 {len(df_mes_sb)} clases · {format_hours(df_mes_sb['Horas'].sum())} dictadas")
+
+        pendientes = df_clases[~df_clases['Pagada']]['Monto'].sum()
+        if pendientes > 0:
+            st.markdown("---")
+            st.markdown("⚠️ **Pendiente de cobro:**")
+            st.markdown(f"🔴 **{format_currency(pendientes)}**")
+
     st.markdown("---")
     st.markdown("**Materias:**")
     for m in MATERIAS:
         st.markdown(f"• {m}")
     st.markdown("**Niveles:** Secundaria · Universidad")
     st.markdown("---")
-    st.caption("v2.0 · 2025")
+    st.caption("v2.1 · 2026")
 
-# ─────────────────────────────────────────────
-# CONEXIÓN PRINCIPAL
-# ─────────────────────────────────────────────
-sheet = get_google_sheet()
-
-if not sheet:
-    st.error("❌ No se pudo conectar con Google Sheets. Verifica Streamlit Secrets.")
-    st.stop()
+if not PASSWORD_APP:
+    st.error(AVISO_PASSWORD)
+if avisos:
+    with st.expander("⚠️ Avisos de la planilla", expanded=False):
+        for a in avisos:
+            st.markdown(f"- {a}")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📊 Dashboard",
@@ -300,137 +283,128 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 with tab1:
     st.markdown('<p class="section-header">📊 Panel de Control</p>', unsafe_allow_html=True)
 
-    df_clases = load_data(sheet, "Clases")
-    df_alumnos = load_data(sheet, "Alumnos")
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        mes_sel = st.selectbox("Mes", MESES, index=hoy.month - 1, key="dash_mes")
+    with col2:
+        anios = anios_disponibles(df_clases, hoy)
+        año_sel = st.selectbox("Año", anios, index=anios.index(hoy.year), key="dash_año")
 
     if df_clases.empty:
         st.info("No hay clases registradas aún. ¡Comenzá registrando tu primera clase!")
-        st.stop()
+    else:
+        mes_num = MESES.index(mes_sel) + 1
+        df_mes = filtrar_mes(df_clases, mes_num, año_sel)
 
-    df_clases['Fecha'] = pd.to_datetime(df_clases['Fecha'], errors='coerce')
+        # ── KPIs ──
+        ingresos_mes  = df_mes['Monto'].sum()
+        clases_mes    = len(df_mes)
+        horas_mes     = df_mes['Horas'].sum()
+        promedio_hora = ingresos_mes / horas_mes if horas_mes > 0 else 0
+        cobrado_mes   = df_mes[df_mes['Pagada']]['Monto'].sum()
+        pendiente_mes = df_mes[~df_mes['Pagada']]['Monto'].sum()
 
-    meses = ['Enero','Febrero','Marzo','Abril','Mayo','Junio',
-             'Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre']
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        mes_sel = st.selectbox("Mes", meses, index=datetime.now().month - 1, key="dash_mes")
-    with col2:
-        año_sel = st.selectbox("Año", [2024, 2025, 2026], index=1, key="dash_año")
+        # Mes anterior para delta
+        mes_ant = mes_num - 1 if mes_num > 1 else 12
+        año_ant = año_sel if mes_num > 1 else año_sel - 1
+        ing_ant = filtrar_mes(df_clases, mes_ant, año_ant)['Monto'].sum()
+        delta_ing = ingresos_mes - ing_ant
 
-    mes_num = meses.index(mes_sel) + 1
-    df_mes = df_clases[(df_clases['Fecha'].dt.month == mes_num) & (df_clases['Fecha'].dt.year == año_sel)]
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("💰 Ingresos del Mes", format_currency(ingresos_mes),
+                  delta=format_currency(delta_ing) if ing_ant > 0 else None,
+                  delta_color="normal")
+        k2.metric("📚 Clases Dictadas", clases_mes)
+        k3.metric("⏰ Horas Totales", format_hours(horas_mes))
+        k4.metric("📊 $/hora promedio", format_currency(promedio_hora))
 
-    # ── KPIs ──
-    ingresos_mes  = df_mes['Total'].sum()
-    clases_mes    = len(df_mes)
-    horas_mes     = df_mes['Duración(h)'].sum()
-    promedio_hora = ingresos_mes / horas_mes if horas_mes > 0 else 0
-    cobrado_mes   = df_mes[df_mes['¿Pagada?'] == 'Sí']['Total'].sum()
-    pendiente_mes = df_mes[df_mes['¿Pagada?'] == 'No']['Total'].sum()
-
-    # Mes anterior para delta
-    mes_ant = mes_num - 1 if mes_num > 1 else 12
-    año_ant = año_sel if mes_num > 1 else año_sel - 1
-    df_ant  = df_clases[(df_clases['Fecha'].dt.month == mes_ant) & (df_clases['Fecha'].dt.year == año_ant)]
-    ing_ant = df_ant['Total'].sum()
-    delta_ing = ingresos_mes - ing_ant
-
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("💰 Ingresos del Mes", format_currency(ingresos_mes),
-              delta=format_currency(delta_ing) if ing_ant > 0 else None,
-              delta_color="normal")
-    k2.metric("📚 Clases Dictadas", clases_mes)
-    k3.metric("⏰ Horas Totales", format_hours(horas_mes))
-    k4.metric("📊 $/hora promedio", format_currency(promedio_hora))
-
-    st.markdown("")
-    k5, k6 = st.columns(2)
-    k5.metric("✅ Cobrado", format_currency(cobrado_mes))
-    k6.metric("⏳ Pendiente de cobro", format_currency(pendiente_mes))
-
-    if pendiente_mes > 0:
-        st.markdown(f"""
-        <div class="alert-pending">
-            ⚠️ Tenés <b>{format_currency(pendiente_mes)}</b> pendientes de cobro este mes.
-        </div>""", unsafe_allow_html=True)
         st.markdown("")
+        k5, k6 = st.columns(2)
+        k5.metric("✅ Cobrado", format_currency(cobrado_mes))
+        k6.metric("⏳ Pendiente de cobro", format_currency(pendiente_mes))
 
-    st.markdown("---")
+        if pendiente_mes > 0:
+            st.markdown(f"""
+            <div class="alert-pending">
+                ⚠️ Tenés <b>{format_currency(pendiente_mes)}</b> pendientes de cobro este mes.
+            </div>""", unsafe_allow_html=True)
+            st.markdown("")
 
-    # ── Gráficos ──
-    col1, col2 = st.columns(2)
+        st.markdown("---")
 
-    with col1:
-        st.markdown("#### 💵 Ingresos por Alumno")
+        # ── Gráficos ──
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("#### 💵 Ingresos por Alumno")
+            if not df_mes.empty:
+                ing_alum = (df_mes.groupby('ID_Alumno', as_index=False)
+                            .agg(Alumno=('Alumno', 'last'), Total=('Monto', 'sum'))
+                            .sort_values('Total', ascending=True))
+                fig1 = px.bar(ing_alum, x='Total', y='Alumno', orientation='h',
+                              color='Total', color_continuous_scale='Blues',
+                              labels={'Total': 'Ingresos ($)', 'Alumno': ''})
+                fig1.update_layout(showlegend=False, coloraxis_showscale=False,
+                                   plot_bgcolor='white', margin=dict(l=0, r=0, t=10, b=0),
+                                   height=280)
+                fig1.update_traces(hovertemplate='%{y}<br>$ %{x:,.0f}')
+                st.plotly_chart(fig1, width="stretch")
+            else:
+                st.info("Sin datos para este mes")
+
+        with col2:
+            st.markdown("#### 📚 Distribución por Materia")
+            if not df_mes.empty:
+                mat_data = df_mes.groupby('Materia').agg(
+                    Clases=('ID_Clase', 'count'),
+                    Ingresos=('Monto', 'sum')
+                ).reset_index()
+                fig2 = px.pie(mat_data, values='Ingresos', names='Materia',
+                              hole=0.5, color_discrete_sequence=px.colors.qualitative.Set2)
+                fig2.update_traces(textposition='outside', textinfo='label+percent')
+                fig2.update_layout(showlegend=False, margin=dict(l=20, r=20, t=10, b=10), height=280)
+                st.plotly_chart(fig2, width="stretch")
+            else:
+                st.info("Sin datos para este mes")
+
+        # ── Evolución mensual ──
+        st.markdown("#### 📈 Evolución Mensual de Ingresos")
+        evo = (df_clases.dropna(subset=['Fecha'])
+               .assign(Mes=lambda d: d['Fecha'].dt.to_period('M').astype(str))
+               .groupby('Mes', as_index=False)
+               .agg(Ingresos=('Monto', 'sum'), Clases=('ID_Clase', 'count'), Horas=('Horas', 'sum')))
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Bar(
+            x=evo['Mes'], y=evo['Ingresos'],
+            name='Ingresos', marker_color='#c2d8f5', opacity=0.7
+        ))
+        fig3.add_trace(go.Scatter(
+            x=evo['Mes'], y=evo['Ingresos'],
+            name='Tendencia', mode='lines+markers',
+            line=dict(color='#1a73e8', width=3),
+            marker=dict(size=8, color='#1a73e8')
+        ))
+        fig3.update_layout(
+            plot_bgcolor='white', paper_bgcolor='white',
+            margin=dict(l=0, r=0, t=10, b=0), height=300,
+            legend=dict(orientation='h', yanchor='bottom', y=1, xanchor='right', x=1),
+            yaxis=dict(gridcolor='#f0f0f0'),
+            xaxis=dict(gridcolor='#f0f0f0')
+        )
+        st.plotly_chart(fig3, width="stretch")
+
+        # ── Horas por alumno (acumulado del mes) ──
         if not df_mes.empty:
-            ing_alum = df_mes.groupby('Alumno')['Total'].sum().sort_values(ascending=True).reset_index()
-            fig1 = px.bar(ing_alum, x='Total', y='Alumno', orientation='h',
-                          color='Total', color_continuous_scale='Blues',
-                          labels={'Total': 'Ingresos ($)', 'Alumno': ''})
-            fig1.update_layout(showlegend=False, coloraxis_showscale=False,
-                               plot_bgcolor='white', margin=dict(l=0, r=0, t=10, b=0),
-                               height=280)
-            fig1.update_traces(hovertemplate='%{y}<br>$ %{x:,.0f}')
-            st.plotly_chart(fig1, use_container_width=True)
-        else:
-            st.info("Sin datos para este mes")
-
-    with col2:
-        st.markdown("#### 📚 Distribución por Materia")
-        if not df_mes.empty:
-            mat_data = df_mes.groupby('Materia').agg(
-                Clases=('ID_Clase', 'count'),
-                Ingresos=('Total', 'sum')
-            ).reset_index()
-            fig2 = px.pie(mat_data, values='Ingresos', names='Materia',
-                          hole=0.5, color_discrete_sequence=px.colors.qualitative.Set2)
-            fig2.update_traces(textposition='outside', textinfo='label+percent')
-            fig2.update_layout(showlegend=False, margin=dict(l=20, r=20, t=10, b=10), height=280)
-            st.plotly_chart(fig2, use_container_width=True)
-        else:
-            st.info("Sin datos para este mes")
-
-    # ── Evolución mensual ──
-    st.markdown("#### 📈 Evolución Mensual de Ingresos")
-    df_clases['Mes_Period'] = df_clases['Fecha'].dt.to_period('M')
-    evo = df_clases.groupby('Mes_Period').agg(
-        Ingresos=('Total', 'sum'),
-        Clases=('ID_Clase', 'count'),
-        Horas=('Duración(h)', 'sum')
-    ).reset_index()
-    evo['Mes'] = evo['Mes_Period'].astype(str)
-
-    fig3 = go.Figure()
-    fig3.add_trace(go.Bar(
-        x=evo['Mes'], y=evo['Ingresos'],
-        name='Ingresos', marker_color='#c2d8f5', opacity=0.7
-    ))
-    fig3.add_trace(go.Scatter(
-        x=evo['Mes'], y=evo['Ingresos'],
-        name='Tendencia', mode='lines+markers',
-        line=dict(color='#1a73e8', width=3),
-        marker=dict(size=8, color='#1a73e8')
-    ))
-    fig3.update_layout(
-        plot_bgcolor='white', paper_bgcolor='white',
-        margin=dict(l=0, r=0, t=10, b=0), height=300,
-        legend=dict(orientation='h', yanchor='bottom', y=1, xanchor='right', x=1),
-        yaxis=dict(gridcolor='#f0f0f0'),
-        xaxis=dict(gridcolor='#f0f0f0')
-    )
-    st.plotly_chart(fig3, use_container_width=True)
-
-    # ── Horas por alumno (acumulado del mes) ──
-    if not df_mes.empty:
-        st.markdown("#### ⏰ Horas Dictadas por Alumno — " + mes_sel)
-        horas_alum = df_mes.groupby('Alumno')['Duración(h)'].sum().reset_index()
-        horas_alum.columns = ['Alumno', 'Horas']
-        fig4 = px.bar(horas_alum, x='Alumno', y='Horas',
-                      color='Alumno', color_discrete_sequence=px.colors.qualitative.Pastel,
-                      labels={'Horas': 'Horas dictadas', 'Alumno': ''})
-        fig4.update_layout(showlegend=False, plot_bgcolor='white',
-                           margin=dict(l=0, r=0, t=10, b=0), height=250)
-        st.plotly_chart(fig4, use_container_width=True)
+            st.markdown("#### ⏰ Horas Dictadas por Alumno — " + mes_sel)
+            horas_alum = (df_mes.groupby('ID_Alumno', as_index=False)
+                          .agg(Alumno=('Alumno', 'last'), Horas=('Horas', 'sum')))
+            fig4 = px.bar(horas_alum, x='Alumno', y='Horas',
+                          color='Alumno', color_discrete_sequence=px.colors.qualitative.Pastel,
+                          labels={'Horas': 'Horas dictadas', 'Alumno': ''})
+            fig4.update_layout(showlegend=False, plot_bgcolor='white',
+                               margin=dict(l=0, r=0, t=10, b=0), height=250)
+            st.plotly_chart(fig4, width="stretch")
 
 # ═══════════════════════════════════════════════
 # TAB 2 · ALUMNOS
@@ -439,146 +413,219 @@ with tab2:
     st.markdown('<p class="section-header">👨‍🎓 Gestión de Alumnos</p>', unsafe_allow_html=True)
     st.markdown('<p class="section-sub">Administrá tu cartera de alumnos</p>', unsafe_allow_html=True)
 
+    if st.session_state.get("flash_alumno"):
+        st.success(st.session_state.pop("flash_alumno"))
+
     col1, col2 = st.columns([2, 1])
 
     with col1:
-        df_alum = load_data(sheet, "Alumnos")
-        if not df_alum.empty:
-            # Estadísticas rápidas por alumno
-            df_cl_all = load_data(sheet, "Clases")
-            if not df_cl_all.empty:
-                resumen = df_cl_all.groupby('Alumno').agg(
-                    Clases_Total=('ID_Clase', 'count'),
-                    Horas_Total=('Duración(h)', 'sum'),
-                    Facturado_Total=('Total', 'sum')
-                ).reset_index()
-                resumen.columns = ['Nombre', 'Clases', 'Horas', 'Facturado']
-                df_alum_merged = df_alum.merge(resumen, on='Nombre', how='left')
-                df_alum_merged['Facturado'] = df_alum_merged['Facturado'].fillna(0).apply(format_currency)
-                df_alum_merged['Horas'] = df_alum_merged['Horas'].fillna(0).apply(format_hours)
-                df_alum_merged['Clases'] = df_alum_merged['Clases'].fillna(0).astype(int)
-                st.dataframe(df_alum_merged, use_container_width=True, height=420, hide_index=True)
+        if not df_alumnos.empty:
+            vista = df_alumnos.copy()
+            if not df_clases.empty:
+                resumen = df_clases.groupby('ID_Alumno', as_index=False).agg(
+                    Clases=('ID_Clase', 'count'),
+                    Horas=('Horas', 'sum'),
+                    Facturado=('Monto', 'sum')
+                )
+                vista = vista.merge(resumen, on='ID_Alumno', how='left')
             else:
-                st.dataframe(df_alum, use_container_width=True, height=420, hide_index=True)
+                vista[['Clases', 'Horas', 'Facturado']] = 0
+            vista['Facturado'] = vista['Facturado'].fillna(0).apply(format_currency)
+            vista['Horas'] = vista['Horas'].fillna(0).apply(format_hours)
+            vista['Clases'] = vista['Clases'].fillna(0).astype(int)
+            vista['PrecioHora'] = vista['PrecioHora'].apply(format_currency)
+            st.dataframe(vista, width="stretch", height=420, hide_index=True)
         else:
             st.info("No hay alumnos registrados aún →")
 
     with col2:
         st.markdown("#### ➕ Nuevo Alumno")
+        precio_def = ultima_tarifa_cargada(df_tarifas, df_alumnos)
         with st.form("nuevo_alumno", clear_on_submit=True):
             nombre     = st.text_input("Nombre completo *")
             materia    = st.selectbox("Materia principal *", MATERIAS)
             curso      = st.selectbox("Nivel *", ["Secundaria", "Universidad"])
             telefono   = st.text_input("Teléfono")
             contacto   = st.text_input("Contacto / Responsable")
-            precio_hora= st.number_input("Precio por hora ($) *", value=4000, step=500)
+            precio_hora= st.number_input("Precio por hora ($) *", min_value=0.0,
+                                         value=float(precio_def), step=500.0, format="%.0f")
             modalidad  = st.selectbox("Modalidad *", ["Presencial", "Virtual", "Híbrida"])
             obs        = st.text_area("Observaciones", height=68)
 
-            if st.form_submit_button("✅ Agregar Alumno", use_container_width=True):
+            if st.form_submit_button("✅ Agregar Alumno", width="stretch"):
                 if not nombre.strip():
                     st.error("El nombre es obligatorio")
                 else:
-                    df_an = load_data(sheet, "Alumnos")
-                    nid = int(df_an['ID_Alumno'].max()) + 1 if not df_an.empty else 1
-                    nuevo = pd.DataFrame([{
-                        'ID_Alumno': nid, 'Nombre': nombre.strip(), 'Materia': materia,
-                        'Curso': curso, 'Teléfono': str(telefono) if telefono else '',
-                        'Contacto': str(contacto) if contacto else '',
-                        'Día': '', 'Frecuencia': '', 'PrecioHora': precio_hora,
-                        'Modalidad': modalidad, 'FechaAlta': datetime.now().strftime('%Y-%m-%d'),
-                        'Estado': 'Activo', 'Observaciones': str(obs) if obs else ''
-                    }])
-                    df_upd = pd.concat([df_an, nuevo], ignore_index=True)
-                    if save_data(sheet, "Alumnos", df_upd):
-                        st.success(f"✅ {nombre} agregado correctamente")
-                        st.balloons()
+                    alta = hoy.isoformat()
+                    try:
+                        nid, _ = sheets.agregar(sheet, "Alumnos", {
+                            'Nombre': nombre.strip(), 'Materia': materia,
+                            'Curso': curso, 'Teléfono': telefono.strip(),
+                            'Contacto': contacto.strip(),
+                            'Día': '', 'Frecuencia': '', 'PrecioHora': float(precio_hora),
+                            'Modalidad': modalidad, 'FechaAlta': alta,
+                            'Estado': 'Activo', 'Observaciones': obs.strip()
+                        })
+                        if df_tarifas is not None:
+                            sheets.agregar(sheet, "Tarifas", {
+                                'ID_Alumno': nid, 'Desde': alta, 'Tipo': 'Hora',
+                                'Monto': float(precio_hora), 'Nota': 'alta'
+                            })
+                    except Exception as e:
+                        st.error(f"No se pudo guardar el alumno: {e}")
+                    else:
+                        st.session_state["flash_alumno"] = f"✅ {nombre.strip()} agregado correctamente"
                         st.rerun()
 
 # ═══════════════════════════════════════════════
 # TAB 3 · REGISTRAR CLASE
 # ═══════════════════════════════════════════════
+# Sin st.form: así el total se actualiza en vivo y cada widget tiene una key estable
+# por alumno (el bug de v2 era que el precio tipeado se descartaba al cambiar de alumno).
 with tab3:
     st.markdown('<p class="section-header">📝 Registrar Nueva Clase</p>', unsafe_allow_html=True)
     st.markdown('<p class="section-sub">Cargá los datos de tu clase de hoy</p>', unsafe_allow_html=True)
 
-    df_activos = load_data(sheet, "Alumnos")
-    if 'Estado' in df_activos.columns:
-        df_activos = df_activos[df_activos['Estado'] == 'Activo']
+    ss = st.session_state
+    if ss.get("flash_clase"):
+        st.success(ss.pop("flash_clase"))
 
-    if df_activos.empty:
+    # Limpieza diferida de los campos del alumno recién guardado (antes de crear los widgets)
+    reset_id = ss.pop("reg_reset", None)
+    if reset_id is not None:
+        for n in ["fecha", "horas", "tarifa", "tarifa_manual", "monto", "monto_manual", "dup_ok"]:
+            ss.pop(f"reg_{n}_{reset_id}", None)
+
+    df_sel = df_alumnos[df_alumnos['Estado'] != 'Baja'].copy() if not df_alumnos.empty else df_alumnos
+    if df_sel.empty:
         st.warning("⚠️ No hay alumnos activos. Agregá uno en la pestaña 'Alumnos'.")
     else:
+        df_sel['_orden'] = (df_sel['Estado'] != 'Activo').astype(int)
+        df_sel = df_sel.sort_values(['_orden', 'Nombre'])
+        ids_sel = df_sel['ID_Alumno'].tolist()
+        etiquetas = {r['ID_Alumno']: r['Nombre'] + ('' if r['Estado'] == 'Activo' else f" ({r['Estado'].lower()})")
+                     for _, r in df_sel.iterrows()}
+        if ss.get("reg_alumno") not in ids_sel:
+            ss.pop("reg_alumno", None)
+
         col1, col2 = st.columns([1.5, 1])
 
         with col1:
-            with st.form("nueva_clase", clear_on_submit=True):
-                alumno_sel = st.selectbox("Alumno *", df_activos['Nombre'].tolist())
-                ad = df_activos[df_activos['Nombre'] == alumno_sel].iloc[0]
+            id_al = st.selectbox("Alumno *", ids_sel, format_func=lambda i: etiquetas[i], key="reg_alumno")
+            ad = df_sel[df_sel['ID_Alumno'] == id_al].iloc[0]
 
-                ca, cb = st.columns(2)
-                with ca:
-                    fecha = st.date_input("Fecha *", value=datetime.now())
-                with cb:
-                    mat_idx = MATERIAS.index(ad['Materia']) if ad['Materia'] in MATERIAS else 0
-                    materia = st.selectbox("Materia *", MATERIAS, index=mat_idx)
+            def k(nombre):
+                return f"reg_{nombre}_{id_al}"
 
-                cc, cd = st.columns(2)
-                with cc:
-                    duracion = st.number_input("Duración (horas) *", min_value=0.5, max_value=8.0,
-                                               value=1.5, step=0.5, format="%.1f")
-                with cd:
-                    precio_hora = st.number_input("Precio/hora ($) *", value=int(ad['PrecioHora']), step=500)
+            ca, cb = st.columns(2)
+            with ca:
+                fecha = st.date_input("Fecha *", value=hoy, format="DD/MM/YYYY", key=k("fecha"))
+            with cb:
+                mat_idx = MATERIAS.index(ad['Materia']) if ad['Materia'] in MATERIAS else 0
+                materia = st.selectbox("Materia *", MATERIAS, index=mat_idx, key=k("materia"))
 
-                ce, cf = st.columns(2)
-                with ce:
-                    pagada = st.selectbox("¿Pagada? *", ["Sí", "No"])
-                with cf:
-                    metodo = st.selectbox("Método", ["Transferencia", "Efectivo", "MercadoPago", "Otro"])
+            tarifa_v, tipo_v, origen_v = tarifa_vigente(id_al, fecha, df_tarifas, df_alumnos)
+            clases_al = df_clases[df_clases['ID_Alumno'] == id_al] if not df_clases.empty else df_clases
+            if k("horas") not in ss:
+                ultimas = clases_al.sort_values(['Fecha', 'ID_Clase'])['Horas'] if not clases_al.empty else []
+                ultima = float(ultimas.iloc[-1]) if len(ultimas) else 0.0
+                ss[k("horas")] = min(max(ultima, 0.25), 12.0) if ultima > 0 else 1.5
+            if not ss.get(k("tarifa_manual")):
+                ss[k("tarifa")] = float(tarifa_v)
 
-                total = round(duracion * precio_hora, 2)
-                st.markdown(f"""
-                <div class="card card-green" style="margin-top:8px;">
-                    <span style="color:#555;font-size:0.85rem;">Total de la clase</span><br>
-                    <span style="font-size:1.8rem;font-weight:700;color:#34a853;">{format_currency(total)}</span>
-                    &nbsp;&nbsp;<span style="color:#888;font-size:0.85rem;">{format_hours(duracion)} × {format_currency(precio_hora)}/h</span>
-                </div>
-                """, unsafe_allow_html=True)
+            unidad = {'Hora': 'hora', 'Clase': 'clase', 'Mensual': 'mes'}.get(tipo_v, 'hora')
+            cc, cd = st.columns(2)
+            with cc:
+                horas = st.number_input("Horas *", min_value=0.25, max_value=12.0, step=0.25,
+                                        format="%.2f", key=k("horas"))
+            with cd:
+                tarifa = st.number_input(f"Tarifa ($/{unidad}) *", min_value=0.0, step=500.0,
+                                         format="%.0f", key=k("tarifa"),
+                                         on_change=marcar, args=(k("tarifa_manual"),))
+            st.caption(f"Tarifa vigente al {format_fecha(fecha)}: {format_currency(tarifa_v)}/{unidad} "
+                       f"(origen: {origen_v.lower()})")
 
-                if st.form_submit_button("✅ Registrar Clase", use_container_width=True):
-                    df_cl = load_data(sheet, "Clases")
-                    nid = int(df_cl['ID_Clase'].max()) + 1 if not df_cl.empty else 1
-                    nueva = pd.DataFrame([{
-                        'ID_Clase': nid,
-                        'Fecha': fecha.strftime('%Y-%m-%d'),
-                        'ID_Alumno': int(ad['ID_Alumno']),
-                        'Alumno': alumno_sel,
-                        'Materia': materia,
-                        'Duración(h)': duracion,
-                        'PrecioHora': precio_hora,
-                        '¿Pagada?': pagada,
-                        'Método': metodo,
-                        'Total': total
-                    }])
-                    df_upd = pd.concat([df_cl, nueva], ignore_index=True)
-                    if save_data(sheet, "Clases", df_upd):
-                        st.success("✅ Clase registrada correctamente")
-                        st.balloons()
+            sugerido = monto_sugerido(horas, tarifa, tipo_v)
+            if not ss.get(k("monto_manual")):
+                ss[k("monto")] = float(sugerido)
+            monto = st.number_input("Monto cobrado ($) *", min_value=0.0, step=500.0, format="%.0f",
+                                    key=k("monto"), on_change=marcar, args=(k("monto_manual"),),
+                                    help="Se precarga con horas × tarifa. Si cobraste otra cosa, pisalo.")
+            if ss.get(k("monto_manual")) or ss.get(k("tarifa_manual")):
+                def _recalcular(claves=(k("monto_manual"), k("tarifa_manual"))):
+                    for c in claves:
+                        ss[c] = False
+                st.button("↺ Volver a tarifa vigente y horas × tarifa", on_click=_recalcular, key=k("recalc"))
+
+            ce, cf = st.columns(2)
+            with ce:
+                pagada = st.selectbox("¿Pagada? *", ["Sí", "No"], key=k("pagada"))
+            with cf:
+                metodo = st.selectbox("Método", METODOS, key=k("metodo"))
+
+            por_hora = monto / horas if horas > 0 else 0
+            detalle = f"{format_hours(horas)} · {format_currency(por_hora)}/h efectivo"
+            if tipo_v == 'Mensual':
+                detalle += " · tarifa mensual: cargá el monto que corresponda"
+            st.markdown(f"""
+            <div class="card card-green" style="margin-top:8px;">
+                <span style="color:#555;font-size:0.85rem;">Monto cobrado</span><br>
+                <span style="font-size:1.8rem;font-weight:700;color:#34a853;">{format_currency(monto)}</span>
+                &nbsp;&nbsp;<span style="color:#888;font-size:0.85rem;">{detalle}</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+            dups = clases_mismo_dia(df_clases, id_al, fecha)
+            confirmado = True
+            if dups is not None and not dups.empty:
+                lista = ", ".join(f"#{r['ID_Clase']} ({format_hours(r['Horas'])}, {format_currency(r['Monto'])})"
+                                  for _, r in dups.iterrows())
+                st.warning(f"⚠️ Ya hay {len(dups)} clase(s) de {ad['Nombre']} el {format_fecha(fecha)}: {lista}.")
+                confirmado = st.checkbox("Es otra clase, guardar igual", key=k("dup_ok"))
+
+            if st.button("✅ Registrar Clase", type="primary", width="stretch",
+                         disabled=not confirmado, key="reg_guardar"):
+                firma = (int(id_al), fecha.isoformat(), float(horas), float(monto))
+                previo = ss.get("reg_ultimo_guardado")
+                if previo and previo[0] == firma and time.time() - previo[1] < 30:
+                    st.info("Esa clase ya se guardó recién (se ignoró el doble clic).")
+                else:
+                    ss["reg_ultimo_guardado"] = (firma, time.time())
+                    try:
+                        nid, _ = sheets.agregar(sheet, "Clases", {
+                            'Fecha': fecha.isoformat(),
+                            'ID_Alumno': int(id_al),
+                            'Alumno': ad['Nombre'],
+                            'Materia': materia,
+                            'Duración(h)': float(horas),
+                            'PrecioHora': float(tarifa),
+                            '¿Pagada?': pagada,
+                            'Método': metodo,
+                            'Total': float(monto),
+                            'MontoCobrado': float(monto),
+                            'HorasReales': float(horas),
+                            'Revisar': '',
+                            'NotaRevision': '',
+                        })
+                    except Exception as e:
+                        ss.pop("reg_ultimo_guardado", None)
+                        st.error(f"No se pudo guardar la clase: {e}")
+                    else:
+                        ss["flash_clase"] = (f"✅ Clase #{nid} registrada: {ad['Nombre']}, {format_fecha(fecha)}, "
+                                             f"{format_hours(horas)}, {format_currency(monto)}")
+                        ss["reg_reset"] = id_al
                         st.rerun()
 
         with col2:
             st.markdown("#### 📋 Últimas 6 Clases")
-            df_ult = load_data(sheet, "Clases")
-            if not df_ult.empty:
-                df_ult['Fecha'] = pd.to_datetime(df_ult['Fecha'], errors='coerce')
-                for _, c in df_ult.sort_values('Fecha', ascending=False).head(6).iterrows():
-                    fecha_str = c['Fecha'].strftime('%d/%m/%Y') if pd.notna(c['Fecha']) else '—'
-                    icon = '✅' if c['¿Pagada?'] == 'Sí' else '⏳'
+            if not df_clases.empty:
+                for _, c in df_clases.sort_values(['Fecha', 'ID_Clase'], ascending=False).head(6).iterrows():
+                    icon = '✅' if c['Pagada'] else '⏳'
                     st.markdown(f"""
                     <div class="clase-card">
                         <b>{c['Alumno']}</b> · {c['Materia']}<br>
-                        📅 {fecha_str} &nbsp; ⏰ {format_hours(c['Duración(h)'])}<br>
-                        💰 {format_currency(c['Total'])} &nbsp; {icon} {c['¿Pagada?']}
+                        📅 {format_fecha(c['Fecha'])} &nbsp; ⏰ {format_hours(c['Horas'])}<br>
+                        💰 {format_currency(c['Monto'])} &nbsp; {icon} {c['¿Pagada?']}
                     </div>
                     """, unsafe_allow_html=True)
             else:
@@ -591,44 +638,49 @@ with tab4:
     st.markdown('<p class="section-header">💰 Historial de Clases</p>', unsafe_allow_html=True)
     st.markdown('<p class="section-sub">Buscá y filtrá todas tus clases</p>', unsafe_allow_html=True)
 
-    df_hist = load_data(sheet, "Clases")
-
-    if df_hist.empty:
+    if df_clases.empty:
         st.info("No hay clases registradas aún")
     else:
-        df_hist['Fecha'] = pd.to_datetime(df_hist['Fecha'], errors='coerce')
-
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
-            f_alumno = st.multiselect("Alumno", sorted(df_hist['Alumno'].unique()))
+            f_alumno = st.multiselect("Alumno", sorted(df_clases['Alumno'].unique()))
         with col2:
-            f_materia = st.multiselect("Materia", sorted(df_hist['Materia'].unique()))
+            f_materia = st.multiselect("Materia", sorted(df_clases['Materia'].unique()))
         with col3:
             f_pago = st.selectbox("Estado de pago", ["Todas", "Pagadas", "Pendientes"])
         with col4:
-            meses_disp = ['Todas'] + meses
-            f_mes = st.selectbox("Mes", meses_disp)
+            f_mes = st.selectbox("Mes", ['Todos'] + MESES, key="hist_mes")
+        with col5:
+            anios_h = anios_disponibles(df_clases, hoy)
+            f_anio = st.selectbox("Año", ['Todos'] + anios_h, index=1 + anios_h.index(hoy.year), key="hist_anio")
 
-        df_f = df_hist.copy()
+        df_f = df_clases.copy()
         if f_alumno:  df_f = df_f[df_f['Alumno'].isin(f_alumno)]
         if f_materia: df_f = df_f[df_f['Materia'].isin(f_materia)]
-        if f_pago == "Pagadas":   df_f = df_f[df_f['¿Pagada?'] == 'Sí']
-        if f_pago == "Pendientes":df_f = df_f[df_f['¿Pagada?'] == 'No']
-        if f_mes != 'Todas':
-            df_f = df_f[df_f['Fecha'].dt.month == meses.index(f_mes) + 1]
+        if f_pago == "Pagadas":    df_f = df_f[df_f['Pagada']]
+        if f_pago == "Pendientes": df_f = df_f[~df_f['Pagada']]
+        if f_anio != 'Todos':
+            df_f = df_f[df_f['Fecha'].dt.year == f_anio]
+        if f_mes != 'Todos':
+            df_f = df_f[df_f['Fecha'].dt.month == MESES.index(f_mes) + 1]
 
         # Tabla
-        df_disp = df_f.sort_values('Fecha', ascending=False).copy()
-        df_disp['Fecha'] = df_disp['Fecha'].dt.strftime('%d/%m/%Y')
-        st.dataframe(df_disp, use_container_width=True, height=380, hide_index=True)
+        df_disp = df_f.sort_values(['Fecha', 'ID_Clase'], ascending=False).copy()
+        df_disp['Fecha'] = df_disp['Fecha'].apply(format_fecha)
+        df_disp['Monto cobrado'] = df_disp['Monto'].apply(format_currency)
+        df_disp['Horas reales'] = df_disp['Horas'].apply(format_hours)
+        df_disp['$/h efectivo'] = df_disp['PorHora'].apply(format_currency)
+        st.dataframe(df_disp[['ID_Clase', 'Fecha', 'Alumno', 'Materia', 'Horas reales', 'Monto cobrado',
+                              '$/h efectivo', '¿Pagada?', 'Método', 'Revisar', 'NotaRevision']],
+                     width="stretch", height=380, hide_index=True)
 
         # Resumen
         st.markdown("---")
         r1, r2, r3, r4 = st.columns(4)
         r1.metric("📚 Clases",        len(df_f))
-        r2.metric("💰 Facturado",     format_currency(df_f['Total'].sum()))
-        r3.metric("✅ Cobrado",        format_currency(df_f[df_f['¿Pagada?']=='Sí']['Total'].sum()))
-        r4.metric("⏳ Pendiente",      format_currency(df_f[df_f['¿Pagada?']=='No']['Total'].sum()))
+        r2.metric("💰 Facturado",     format_currency(df_f['Monto'].sum()))
+        r3.metric("✅ Cobrado",        format_currency(df_f[df_f['Pagada']]['Monto'].sum()))
+        r4.metric("⏳ Pendiente",      format_currency(df_f[~df_f['Pagada']]['Monto'].sum()))
 
 # ═══════════════════════════════════════════════
 # TAB 5 · ANÁLISIS
@@ -637,61 +689,59 @@ with tab5:
     st.markdown('<p class="section-header">📈 Análisis y Proyecciones</p>', unsafe_allow_html=True)
     st.markdown('<p class="section-sub">Métricas avanzadas de tu actividad</p>', unsafe_allow_html=True)
 
-    df_an = load_data(sheet, "Clases")
-    df_al = load_data(sheet, "Alumnos")
+    df_an = df_clases.dropna(subset=['Fecha']) if not df_clases.empty else df_clases
 
     if df_an.empty:
         st.info("No hay suficientes datos. Comenzá registrando clases.")
     else:
-        df_an['Fecha'] = pd.to_datetime(df_an['Fecha'], errors='coerce')
-        df_an['Mes_Period'] = df_an['Fecha'].dt.to_period('M')
+        df_an = df_an.assign(Mes=df_an['Fecha'].dt.to_period('M').astype(str))
 
         # ── Bloque 1: rendimiento general ──
         col1, col2 = st.columns(2)
 
         with col1:
             st.markdown("#### 🎯 Rendimiento por Alumno (acumulado)")
-            ra = df_an.groupby('Alumno').agg(
+            ra = df_an.groupby('ID_Alumno', as_index=False).agg(
+                Alumno=('Alumno', 'last'),
                 Clases=('ID_Clase', 'count'),
-                Horas=('Duración(h)', 'sum'),
-                Facturado=('Total', 'sum')
-            ).reset_index().sort_values('Facturado', ascending=False)
+                Horas=('Horas', 'sum'),
+                Facturado=('Monto', 'sum')
+            ).sort_values('Facturado', ascending=False)
             ra['Facturado_fmt'] = ra['Facturado'].apply(format_currency)
             ra['Horas_fmt']     = ra['Horas'].apply(format_hours)
             st.dataframe(
                 ra[['Alumno', 'Clases', 'Horas_fmt', 'Facturado_fmt']].rename(
                     columns={'Horas_fmt': 'Horas', 'Facturado_fmt': 'Facturado'}
                 ),
-                use_container_width=True, hide_index=True
+                width="stretch", hide_index=True
             )
 
         with col2:
             st.markdown("#### 📚 Rendimiento por Materia (acumulado)")
-            rm = df_an.groupby('Materia').agg(
+            rm = df_an.groupby('Materia', as_index=False).agg(
                 Clases=('ID_Clase', 'count'),
-                Horas=('Duración(h)', 'sum'),
-                Facturado=('Total', 'sum')
-            ).reset_index().sort_values('Facturado', ascending=False)
+                Horas=('Horas', 'sum'),
+                Facturado=('Monto', 'sum')
+            ).sort_values('Facturado', ascending=False)
             rm['Facturado_fmt'] = rm['Facturado'].apply(format_currency)
             rm['Horas_fmt']     = rm['Horas'].apply(format_hours)
             st.dataframe(
                 rm[['Materia', 'Clases', 'Horas_fmt', 'Facturado_fmt']].rename(
                     columns={'Horas_fmt': 'Horas', 'Facturado_fmt': 'Facturado'}
                 ),
-                use_container_width=True, hide_index=True
+                width="stretch", hide_index=True
             )
 
         st.markdown("---")
 
         # ── Bloque 2: Ingreso mensual por alumno (stacked) ──
         st.markdown("#### 💹 Ingresos Mensuales por Alumno")
-        pivot = df_an.groupby(['Mes_Period', 'Alumno'])['Total'].sum().reset_index()
-        pivot['Mes'] = pivot['Mes_Period'].astype(str)
+        pivot = df_an.groupby(['Mes', 'Alumno'], as_index=False)['Monto'].sum()
         fig_stack = px.bar(
-            pivot, x='Mes', y='Total', color='Alumno',
+            pivot, x='Mes', y='Monto', color='Alumno',
             barmode='stack',
             color_discrete_sequence=px.colors.qualitative.Set2,
-            labels={'Total': 'Ingresos ($)', 'Mes': 'Mes'}
+            labels={'Monto': 'Ingresos ($)', 'Mes': 'Mes'}
         )
         fig_stack.update_layout(
             plot_bgcolor='white', height=320,
@@ -699,32 +749,28 @@ with tab5:
             legend=dict(orientation='h', yanchor='bottom', y=1, xanchor='right', x=1),
             yaxis=dict(gridcolor='#f0f0f0')
         )
-        st.plotly_chart(fig_stack, use_container_width=True)
+        st.plotly_chart(fig_stack, width="stretch")
 
         # ── Bloque 3: Precio/hora promedio en el tiempo ──
         st.markdown("#### 💲 Evolución del Precio/Hora Promedio")
-        ph_evo = df_an.groupby('Mes_Period').apply(
-            lambda x: (x['Total'].sum() / x['Duración(h)'].sum()) if x['Duración(h)'].sum() > 0 else 0
-        ).reset_index()
-        ph_evo.columns = ['Mes_Period', 'Precio_Hora_Prom']
-        ph_evo['Mes'] = ph_evo['Mes_Period'].astype(str)
-        fig_ph = px.line(ph_evo, x='Mes', y='Precio_Hora_Prom', markers=True,
-                         labels={'Precio_Hora_Prom': '$/hora promedio', 'Mes': 'Mes'})
+        ph_evo = precio_hora_por_mes(df_an)
+        fig_ph = px.line(ph_evo, x='Mes', y='PorHora', markers=True,
+                         labels={'PorHora': '$/hora promedio', 'Mes': 'Mes'})
         fig_ph.update_traces(line_color='#ea4335', marker=dict(size=9, color='#ea4335'))
         fig_ph.update_layout(plot_bgcolor='white', height=270,
                              margin=dict(l=0, r=0, t=10, b=0),
                              yaxis=dict(gridcolor='#f0f0f0'))
-        st.plotly_chart(fig_ph, use_container_width=True)
+        st.plotly_chart(fig_ph, width="stretch")
 
         st.markdown("---")
 
         # ── Bloque 4: Proyección ──
         st.markdown("#### 💡 Proyección Mensual")
-        total_alumnos = len(df_al[df_al['Estado'] == 'Activo']) if 'Estado' in df_al.columns else len(df_al)
-        n_meses = max(df_an['Mes_Period'].nunique(), 1)
-        ing_prom_mes = df_an.groupby('Mes_Period')['Total'].sum().mean()
+        total_alumnos = int((df_alumnos['Estado'] == 'Activo').sum()) if not df_alumnos.empty else 0
+        n_meses = max(df_an['Mes'].nunique(), 1)
+        ing_prom_mes = df_an.groupby('Mes')['Monto'].sum().mean()
         clases_prom  = len(df_an) / n_meses
-        horas_prom   = df_an['Duración(h)'].sum() / n_meses
+        horas_prom   = df_an['Horas'].sum() / n_meses
 
         p1, p2, p3, p4 = st.columns(4)
         p1.metric("👨‍🎓 Alumnos Activos",       total_alumnos)
